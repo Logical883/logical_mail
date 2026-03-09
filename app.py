@@ -95,13 +95,25 @@ def run_campaign(campaign_id: str, cfg: dict, recipients: list[dict],
             state["status"] = "cancelled"
             break
 
-        email = recipient.get("email", "").strip()
+        # Auto-detect email column (case-insensitive, common naming variants)
+        email = ""
+        for key in recipient:
+            if key.lower().strip() in ("email", "e-mail", "emailaddress", "email_address", "mail"):
+                email = recipient[key].strip()
+                break
+        # Fallback: scan all values for anything that looks like an email
+        if not email:
+            for val in recipient.values():
+                if "@" in str(val) and "." in str(val):
+                    email = str(val).strip()
+                    break
+
         state["current"] = i + 1
         state["current_email"] = email
 
         if not email or "@" not in email:
             state["skipped"] += 1
-            state["log"].append({"type": "warn", "msg": f"Skipped invalid email: {email!r}"})
+            state["log"].append({"type": "warn", "msg": f"Row {i+1}: No valid email found. Columns detected: {list(recipient.keys())}"})
             continue
 
         try:
