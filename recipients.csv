@@ -1,0 +1,4 @@
+email,first_name,company,role,pain_point,reason,cta_link,cta_text,opt_in_source,unsubscribe_link
+alice@acme.com,Alice,Acme Corp,Head of Marketing,tracking campaign ROI across channels,we saw your recent talk on growth loops,https://yoursite.com/demo,Book a Demo →,our newsletter,https://yoursite.com/unsubscribe?id=1
+bob@techwave.io,Bob,TechWave,CTO,managing deployment pipelines at scale,your team's work on distributed systems caught our eye,https://yoursite.com/demo,See the Docs →,our webinar,https://yoursite.com/unsubscribe?id=2
+carol@greenleaf.org,Carol,Greenleaf,Operations Lead,coordinating volunteers and resources efficiently,we admire the impact your org is creating,https://yoursite.com/demo,Start Free Trial →,our podcast,https://yoursite.com/unsubscribe?id=3

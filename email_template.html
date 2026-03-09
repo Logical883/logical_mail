@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Email</title>
+  <style>
+    body { margin: 0; padding: 0; background: #f4f4f4; font-family: Georgia, serif; }
+    .wrapper { max-width: 600px; margin: 40px auto; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .header { background: #1a1a2e; padding: 36px 40px; }
+    .header h1 { margin: 0; color: #e0c97f; font-size: 22px; letter-spacing: 1px; font-weight: normal; }
+    .body { padding: 36px 40px; color: #333; line-height: 1.7; font-size: 16px; }
+    .body p { margin: 0 0 16px; }
+    .highlight { background: #f0f7ff; border-left: 4px solid #4a90d9; padding: 14px 18px; border-radius: 0 6px 6px 0; margin: 20px 0; }
+    .cta { text-align: center; margin: 28px 0; }
+    .cta a { background: #1a1a2e; color: #e0c97f; padding: 14px 32px; border-radius: 4px; text-decoration: none; font-size: 15px; letter-spacing: 0.5px; }
+    .footer { background: #f9f9f9; padding: 20px 40px; font-size: 12px; color: #999; text-align: center; border-top: 1px solid #eee; }
+    .footer a { color: #999; }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <div class="header">
+      <h1>{{ company_name | default("Your Company") }}</h1>
+    </div>
+
+    <div class="body">
+      <p>Hi {{ first_name }},</p>
+
+      <p>
+        I'm reaching out to folks at <strong>{{ company }}</strong> because
+        {{ reason | default("we think what you're building is genuinely exciting") }}.
+      </p>
+
+      {% if ai_paragraph %}
+      <div class="highlight">
+        {{ ai_paragraph }}
+      </div>
+      {% endif %}
+
+      <p>
+        As a <strong>{{ role }}</strong>, you'll know better than anyone that
+        {{ pain_point | default("time spent on manual processes adds up fast") }}.
+        We built something that tackles exactly that.
+      </p>
+
+      <div class="cta">
+        <a href="{{ cta_link | default('https://yourwebsite.com') }}">{{ cta_text | default('See How It Works →') }}</a>
+      </div>
+
+      <p>Happy to answer any questions or set up a quick call at your convenience.</p>
+
+      <p>
+        Best,<br/>
+        <strong>{{ sender_name | default("The Team") }}</strong>
+      </p>
+    </div>
+
+    <div class="footer">
+      You received this because you opted in at {{ opt_in_source | default("our website") }}.
+      <a href="{{ unsubscribe_link | default('#') }}">Unsubscribe</a>
+    </div>
+  </div>
+</body>
+</html>
