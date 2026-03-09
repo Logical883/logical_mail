@@ -475,7 +475,7 @@ textarea.code-editor {
   display: none;
   position: fixed; inset: 0;
   background: rgba(0,0,0,0.6);
-  z-index: 98;
+  z-index: 199;
 }
 .sidebar-overlay.visible { display: block; }
 
@@ -502,10 +502,11 @@ textarea.code-editor {
     left: -280px;
     top: 0; bottom: 0;
     width: 260px;
-    z-index: 99;
+    z-index: 200;
     height: 100vh;
     transition: left 0.28s cubic-bezier(0.4,0,0.2,1);
     box-shadow: 4px 0 24px rgba(0,0,0,0.4);
+    overflow-y: auto;
   }
   .sidebar.open { left: 0; }
 
@@ -925,6 +926,8 @@ function goTo(n) {
   });
   currentPage = n;
   if (n === 3) fillSummary();
+  // Always close sidebar on mobile after navigation
+  if (window.innerWidth <= 768) closeSidebar();
 }
 
 // ── CSV ───────────────────────────────────────────────────────────────────
@@ -1184,13 +1187,6 @@ function closeSidebar() {
   document.getElementById('sidebar-overlay').classList.remove('visible');
   document.getElementById('hamburger').classList.remove('open');
 }
-
-// Close sidebar when a step is clicked on mobile
-document.querySelectorAll('.step').forEach(step => {
-  step.addEventListener('click', () => {
-    if (window.innerWidth <= 768) closeSidebar();
-  });
-});
 {% endraw %}
 </script>
 </body>
