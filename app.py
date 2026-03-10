@@ -138,7 +138,11 @@ def run_campaign(campaign_id, cfg, recipients, template_str, use_ai, dry_run, ba
     state["status"] = "running"
     opens_db[campaign_id] = []
     unsubs_db.setdefault(campaign_id, set())
-    ai_client = anthropic.Anthropic() if use_ai else None
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    ai_client = anthropic.Anthropic(api_key=api_key) if (use_ai and api_key) else None
+    if use_ai and not api_key:
+        state["log"].append({"type": "warn", "msg": "⚠️ AI personalization skipped — ANTHROPIC_API_KEY not set on server."})
+        use_ai = False
 
     for i, recipient in enumerate(recipients):
         if state.get("cancelled"):
