@@ -1,14 +1,14 @@
 {
   "SMTP_HOST": "smtp.gmail.com",
   "SMTP_PORT": 587,
-  "SMTP_USER": "you@gmail.com",
-  "SMTP_PASSWORD": "your_gmail_app_password",
-  "FROM_NAME": "Your Name",
-  "SUBJECT_TEMPLATE": "Hi {{first_name}}, quick note from us",
+  "SMTP_USER": "yeboahalbert1978@gmail.com",
+  "SMTP_PASSWORD": "tqij oyfu sief obxp",
+  "FROM_NAME": "Logical Legend",
+  "SUBJECT_TEMPLATE": "Hi {{first_name}}, quick note from Miss Mailiana Brand",
   "CSV_FILE": "recipients.csv",
   "TEMPLATE_FILE": "email_template.html",
   "OUTPUT_DIR": "previews",
-  "DELAY_SECONDS": 1.5,
+  "DELAY_SECONDS": 1,
   "USE_AI_PERSONALIZATION": false,
   "AI_FIELD_NAME": "ai_paragraph"
 }
