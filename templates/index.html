@@ -628,7 +628,7 @@ textarea.code-editor {
       <button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">
         <span class="icon">🌙</span><span id="theme-label">Dark mode</span>
       </button>
-      <div style="margin-top:10px; font-size:11px; color:var(--muted); font-family:'DM Mono',monospace;">v1.0 · powered by Claude AI</div>
+      <div style="margin-top:10px; font-size:11px; color:var(--muted); font-family:'DM Mono',monospace;">Developed by: Logical Legend</div>
     </div>
   </aside>
 
@@ -747,11 +747,11 @@ textarea.code-editor {
         <div class="grid2">
           <div class="form-group">
             <label>From Name</label>
-            <input type="text" id="from-name" placeholder="Jane Smith"/>
+            <input type="text" id="from-name" placeholder="Logical Legend"/>
           </div>
           <div class="form-group">
             <label>From Email</label>
-            <input type="email" id="smtp-user" placeholder="jane@gmail.com"/>
+            <input type="email" id="smtp-user" placeholder="logical@gmail.com"/>
           </div>
         </div>
       </div>
@@ -885,7 +885,12 @@ textarea.code-editor {
             </div>
             <div style="font-size:13px;color:var(--muted);margin-top:8px" id="monitor-current">—</div>
           </div>
-          <button class="btn btn-danger" id="cancel-btn" onclick="cancelCampaign()">Stop</button>
+          <div style="display:flex;gap:10px;align-items:center">
+            <button class="btn btn-outline" id="refresh-btn" onclick="refreshStats()" title="Refresh stats">
+              🔄 Refresh
+            </button>
+            <button class="btn btn-danger" id="cancel-btn" onclick="cancelCampaign()">Stop</button>
+          </div>
         </div>
 
         <div class="progress-bar-wrap">
@@ -898,7 +903,7 @@ textarea.code-editor {
           <div class="stat-card stat-failed"><div class="stat-num" id="m-failed">0</div><div class="stat-lbl">Failed</div></div>
           <div class="stat-card stat-skipped"><div class="stat-num" id="m-skipped">0</div><div class="stat-lbl">Skipped</div></div>
           <div class="stat-card stat-total"><div class="stat-num" id="m-total">0</div><div class="stat-lbl">Total</div></div>
-          <div class="stat-card" style="border-color:rgba(62,207,110,0.3)"><div class="stat-num" id="m-opens" style="color:var(--accent)">0</div><div class="stat-lbl">Opens</div></div>
+          <div class="stat-card" style="border-color:rgba(62,207,110,0.3)"><div class="stat-num" id="m-opens" style="color:var(--accent)">0</div><div class="stat-lbl">Opened</div></div>
           <div class="stat-card" style="border-color:rgba(251,191,36,0.3)"><div class="stat-num" id="m-unsubs" style="color:var(--warn)">0</div><div class="stat-lbl">Unsubs</div></div>
         </div>
 
@@ -1175,6 +1180,33 @@ function startPolling() {
     logBox.scrollTop = logBox.scrollHeight;
 
   }, 1200);
+}
+
+async function refreshStats() {
+  if (!campaignId) return;
+  const btn = document.getElementById('refresh-btn');
+  btn.textContent = '⏳ Refreshing...';
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/status/${campaignId}`);
+    const d = await res.json();
+    if (!d.ok) return;
+    document.getElementById('m-sent').textContent = d.sent;
+    document.getElementById('m-failed').textContent = d.failed;
+    document.getElementById('m-skipped').textContent = d.skipped;
+    document.getElementById('m-opens').textContent = d.opens || 0;
+    document.getElementById('m-unsubs').textContent = d.unsubscribes || 0;
+    // Append any new log entries
+    const logBox = document.getElementById('log-box');
+    logBox.innerHTML = d.log.map(entry => {
+      const cls = entry.type === 'success' ? 'log-success' : entry.type === 'error' ? 'log-error' : entry.type === 'warn' ? 'log-warn' : 'log-info';
+      const now = new Date().toLocaleTimeString();
+      return `<div class="log-entry"><span class="log-ts">${now}</span><span class="${cls}">${entry.msg}</span></div>`;
+    }).join('');
+    logBox.scrollTop = logBox.scrollHeight;
+  } finally {
+    setTimeout(() => { btn.textContent = '🔄 Refresh'; btn.disabled = false; }, 600);
+  }
 }
 
 async function cancelCampaign() {
