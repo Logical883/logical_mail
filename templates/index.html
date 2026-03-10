@@ -641,10 +641,10 @@ textarea.code-editor {
       </div>
 
       <div class="dropzone" id="dropzone">
-        <input type="file" accept=".csv" id="csv-input" onchange="handleCSV(this.files[0])"/>
+        <input type="file" accept=".csv,.xlsx,.xls" id="csv-input" onchange="handleCSV(this.files[0])"/>
         <div class="dropzone-icon">📋</div>
-        <div class="dropzone-text"><strong>Drop your CSV here</strong> or click to browse</div>
-        <div class="dropzone-hint">email, first_name, company, role, cta_link, …</div>
+        <div class="dropzone-text"><strong>Drop your file here</strong> or click to browse</div>
+        <div class="dropzone-hint">Accepts .csv · .xlsx · .xls — must have an email column</div>
       </div>
 
       <div id="csv-preview" style="display:none">

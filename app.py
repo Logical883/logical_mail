@@ -17,6 +17,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import anthropic
+import openpyxl
 from flask import Flask, jsonify, render_template, request
 from jinja2 import Template, TemplateError
 
@@ -33,10 +34,49 @@ log = logging.getLogger(__name__)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def parse_csv(file_content: str) -> tuple[list[dict], list[str]]:
+    """Parse CSV content, handling BOM and common encoding issues."""
+    # Strip BOM if present
+    if file_content.startswith('\ufeff'):
+        file_content = file_content[1:]
     reader = csv.DictReader(io.StringIO(file_content))
-    rows = [{k: (v or "").strip() for k, v in row.items()} for row in reader]
-    columns = reader.fieldnames or []
-    return rows, list(columns)
+    rows = [{k.strip(): str(v or "").strip() for k, v in row.items()} for row in reader]
+    columns = [c.strip() for c in (reader.fieldnames or [])]
+    return rows, columns
+
+
+def parse_excel(file_bytes: bytes) -> tuple[list[dict], list[str]]:
+    """Parse Excel (.xlsx / .xls) file bytes into rows and columns."""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    ws = wb.active
+    rows_iter = list(ws.iter_rows(values_only=True))
+    if not rows_iter:
+        return [], []
+    # First row = headers
+    headers = [str(h).strip() if h is not None else f"col_{i}" for i, h in enumerate(rows_iter[0])]
+    rows = []
+    for row in rows_iter[1:]:
+        record = {headers[i]: str(v).strip() if v is not None else "" for i, v in enumerate(row)}
+        # Skip completely empty rows
+        if any(v for v in record.values()):
+            rows.append(record)
+    wb.close()
+    return rows, headers
+
+
+def parse_file(file) -> tuple[list[dict], list[str]]:
+    """Auto-detect file type and parse accordingly."""
+    filename = file.filename.lower()
+    file_bytes = file.read()
+
+    if filename.endswith(('.xlsx', '.xls')):
+        return parse_excel(file_bytes)
+    else:
+        # Try UTF-8 first, fallback to latin-1
+        try:
+            content = file_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            content = file_bytes.decode('latin-1')
+        return parse_csv(content)
 
 
 def render_html(template_str: str, variables: dict) -> str:
@@ -184,10 +224,14 @@ def parse_csv_route():
     file = request.files.get("file")
     if not file:
         return jsonify({"ok": False, "error": "No file"}), 400
-    content = file.read().decode("utf-8")
-    rows, columns = parse_csv(content)
-    return jsonify({"ok": True, "columns": columns, "count": len(rows),
-                    "sample": rows[:3], "rows": rows})
+    try:
+        rows, columns = parse_file(file)
+        if not rows:
+            return jsonify({"ok": False, "error": "File appears to be empty or unreadable"}), 400
+        return jsonify({"ok": True, "columns": columns, "count": len(rows),
+                        "sample": rows[:3], "rows": rows})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Could not read file: {str(e)}"}), 400
 
 
 @app.route("/api/launch", methods=["POST"])
