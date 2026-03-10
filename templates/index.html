@@ -528,7 +528,7 @@ textarea.code-editor {
   #preview-iframe { min-height: 220px; }
 
   /* Stats: 2 columns on mobile */
-  .stats-row { grid-template-columns: 1fr 1fr; }
+  .stats-row { grid-template-columns: 1fr 1fr !important; }
   .stat-num { font-size: 22px; }
 
   /* CSV info: wrap */
@@ -805,6 +805,33 @@ textarea.code-editor {
         <p style="font-size:12px;color:var(--muted);margin-top:8px">Used only on the server for Claude API calls. Not stored.</p>
       </div>
 
+      <div class="card">
+        <div class="card-title">⏰ Scheduled Sending</div>
+        <div class="toggle-row" style="margin-bottom:16px">
+          <div class="toggle-info">
+            <h4>Schedule for later</h4>
+            <p>Set a future date and time to send automatically. Leave off to send immediately.</p>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="use-schedule" onchange="toggleSchedule()"/>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div id="schedule-fields" style="display:none">
+          <div class="grid2">
+            <div class="form-group">
+              <label>Date</label>
+              <input type="date" id="schedule-date"/>
+            </div>
+            <div class="form-group">
+              <label>Time (your local time)</label>
+              <input type="time" id="schedule-time" value="09:00"/>
+            </div>
+          </div>
+          <p style="font-size:12px;color:var(--muted);margin-top:4px">⚠️ Keep the app running until the scheduled time.</p>
+        </div>
+      </div>
+
       <div class="actions">
         <button class="btn btn-ghost" onclick="goTo(1)">← Back</button>
         <button class="btn btn-primary" onclick="goTo(3)">Review & Launch →</button>
@@ -863,11 +890,13 @@ textarea.code-editor {
         </div>
         <div style="font-size:12px;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:20px" id="progress-text">0 / 0</div>
 
-        <div class="stats-row">
+        <div class="stats-row" style="grid-template-columns:repeat(6,1fr)">
           <div class="stat-card stat-sent"><div class="stat-num" id="m-sent">0</div><div class="stat-lbl">Sent</div></div>
           <div class="stat-card stat-failed"><div class="stat-num" id="m-failed">0</div><div class="stat-lbl">Failed</div></div>
           <div class="stat-card stat-skipped"><div class="stat-num" id="m-skipped">0</div><div class="stat-lbl">Skipped</div></div>
           <div class="stat-card stat-total"><div class="stat-num" id="m-total">0</div><div class="stat-lbl">Total</div></div>
+          <div class="stat-card" style="border-color:rgba(62,207,110,0.3)"><div class="stat-num" id="m-opens" style="color:var(--accent)">0</div><div class="stat-lbl">Opens</div></div>
+          <div class="stat-card" style="border-color:rgba(251,191,36,0.3)"><div class="stat-num" id="m-unsubs" style="color:var(--warn)">0</div><div class="stat-lbl">Unsubs</div></div>
         </div>
 
         <div class="card">
@@ -1007,6 +1036,11 @@ function livePreview() {
   }, 400);
 }
 
+function toggleSchedule() {
+  const on = document.getElementById('use-schedule').checked;
+  document.getElementById('schedule-fields').style.display = on ? 'block' : 'none';
+}
+
 function toggleAI() {
   const on = document.getElementById('use-ai').checked;
   document.getElementById('ai-key-card').style.display = on ? 'block' : 'none';
@@ -1038,6 +1072,16 @@ function fillSummary() {
 // ── Launch ────────────────────────────────────────────────────────────────
 async function launchCampaign() {
   const isDry = document.getElementById('send-mode').value === 'dry';
+  // Build scheduled_at ISO string if scheduling is enabled
+  let scheduled_at = null;
+  if (document.getElementById('use-schedule').checked) {
+    const d = document.getElementById('schedule-date').value;
+    const t = document.getElementById('schedule-time').value;
+    if (d && t) {
+      scheduled_at = new Date(`${d}T${t}`).toISOString();
+    }
+  }
+
   const payload = {
     smtp: {
       smtp_host: document.getElementById('smtp-host').value,
@@ -1052,6 +1096,7 @@ async function launchCampaign() {
     template: document.getElementById('tpl-editor').value,
     use_ai: document.getElementById('use-ai').checked,
     dry_run: isDry,
+    scheduled_at,
   };
 
   document.getElementById('launch-btn').disabled = true;
@@ -1092,11 +1137,17 @@ function startPolling() {
     document.getElementById('m-sent').textContent = d.sent;
     document.getElementById('m-failed').textContent = d.failed;
     document.getElementById('m-skipped').textContent = d.skipped;
+    document.getElementById('m-opens').textContent = d.opens || 0;
+    document.getElementById('m-unsubs').textContent = d.unsubscribes || 0;
     document.getElementById('monitor-current').textContent = d.current_email ? `Processing: ${d.current_email}` : '';
 
     // Badge
     const badge = document.getElementById('monitor-badge');
-    if (d.status === 'running') {
+    if (d.status === 'scheduled') {
+      badge.className = 'status-badge badge-pending';
+      const schedTime = d.scheduled_for ? new Date(d.scheduled_for).toLocaleString() : '';
+      badge.innerHTML = `<span class="pulse pulse-yellow"></span> Scheduled${schedTime ? ' for ' + schedTime : ''}`;
+    } else if (d.status === 'running') {
       badge.className = 'status-badge badge-running';
       badge.innerHTML = '<span class="pulse pulse-yellow"></span> Running';
     } else if (d.status === 'done') {
