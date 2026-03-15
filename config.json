@@ -2,7 +2,7 @@
   "SMTP_HOST": "smtp.gmail.com",
   "SMTP_PORT": 587,
   "SMTP_USER": "yeboahalbert1978@gmail.com",
-  "SMTP_PASSWORD": "tqij oyfu sief obxp",
+  "SMTP_PASSWORD": "My_Gmail AppPassword",
   "FROM_NAME": "Logical Legend",
   "SUBJECT_TEMPLATE": "Hi {{first_name}}, quick note from Miss Mailiana Brand",
   "CSV_FILE": "recipients.csv",
