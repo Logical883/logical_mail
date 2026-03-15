@@ -1433,9 +1433,12 @@ async function loadHistory(){
             <div class="hmet hmet-unsub"><span class="hmet-val">${c.unsubscribes}</span><span class="hmet-lbl">Unsubs</span></div>
           </div>
         </div>
-        <div>${c.status==='running'||c.status==='scheduled'?
-          `<button class="btn btn-outline" style="font-size:11px;padding:6px 12px" onclick="resumeMonitor('${c.id}')">Monitor →</button>`
-          :''}</div>
+        <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end">
+          ${c.status==='running'||c.status==='scheduled'?
+            `<button class="btn btn-outline" style="font-size:11px;padding:6px 12px" onclick="resumeMonitor('${c.id}')">Monitor →</button>`
+            :''}
+          <button class="btn btn-danger" style="font-size:11px;padding:6px 12px" onclick="deleteCampaign('${c.id}',this)">🗑 Delete</button>
+        </div>
       </div>`;
     }).join('');
   }catch(e){
@@ -1448,6 +1451,29 @@ function resumeMonitor(id){
   document.getElementById('pre-launch').style.display='none';
   document.getElementById('monitor').style.display='block';
   goTo(3); startPoll();
+}
+
+async function deleteCampaign(id, btn){
+  if(!confirm(`Delete campaign ${id}? This cannot be undone.`)) return;
+  btn.disabled=true; btn.textContent='Deleting…';
+  try{
+    const res=await fetch(`/api/campaigns/${id}`,{method:'DELETE'});
+    const d=await res.json();
+    if(!d.ok){ toast('Error: '+d.error,'bad'); btn.disabled=false; btn.textContent='🗑 Delete'; return; }
+    // Remove the card from the DOM with a fade
+    const card=btn.closest('.hist-card');
+    card.style.transition='opacity .3s,transform .3s';
+    card.style.opacity='0'; card.style.transform='translateX(20px)';
+    setTimeout(()=>{
+      card.remove();
+      // Show empty state if no cards left
+      if(!document.querySelectorAll('.hist-card').length){
+        document.getElementById('hist-list').innerHTML=
+          '<div class="hist-empty"><span class="hist-empty-icon">📭</span>No campaigns yet. Launch one to see it here.</div>';
+      }
+    },300);
+    toast(`Campaign ${id} deleted`,'ok');
+  }catch(e){ toast('Delete failed','bad'); btn.disabled=false; btn.textContent='🗑 Delete'; }
 }
 
 // ══════════════════════════════════════════

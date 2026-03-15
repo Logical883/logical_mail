@@ -513,6 +513,40 @@ def list_campaigns():
         })
     return jsonify({"ok": True, "campaigns": sorted(result, key=lambda x: x["created_at"], reverse=True)})
 
+
+@app.route("/api/campaigns/<campaign_id>", methods=["DELETE"])
+def delete_campaign(campaign_id):
+    """Delete a campaign and all its tracking data."""
+    c = load_campaigns()
+    if campaign_id not in c:
+        return jsonify({"ok": False, "error": "Campaign not found"}), 404
+
+    # Don't allow deleting a running campaign
+    if c[campaign_id].get("status") == "running":
+        return jsonify({"ok": False, "error": "Cannot delete a running campaign. Stop it first."}), 400
+
+    # Remove from all stores
+    del c[campaign_id]
+    save_campaigns(c)
+
+    opens = load_opens()
+    if campaign_id in opens:
+        del opens[campaign_id]
+        save_opens(opens)
+
+    unsubs = load_unsubs()
+    if campaign_id in unsubs:
+        del unsubs[campaign_id]
+        save_unsubs(unsubs)
+
+    # Also remove from in-memory cache
+    campaigns.pop(campaign_id, None)
+    opens_db.pop(campaign_id, None)
+    unsubs_db.pop(campaign_id, None)
+
+    log.info(f"Campaign {campaign_id} deleted")
+    return jsonify({"ok": True})
+
 @app.route("/api/opens/<campaign_id>")
 def get_opens(campaign_id):
     return jsonify({"ok": True, "opens": load_opens().get(campaign_id, [])})
