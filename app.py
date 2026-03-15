@@ -166,13 +166,35 @@ def inject_tracking(html_body, campaign_id, email, base_url):
     html_body = wrap_links(html_body, campaign_id, encoded_email, base_url)
     return html_body
 
-def build_mime(sender_email, sender_name, subject, to_email, html_body):
-    msg = MIMEMultipart("alternative")
+def build_mime(sender_email, sender_name, subject, to_email, html_body, attachments=None):
+    """Build MIME email, optionally with file attachments."""
+    from email.mime.base import MIMEBase
+    from email import encoders
+    import mimetypes
+
+    # Use 'mixed' if attachments exist, else 'alternative'
+    if attachments:
+        msg = MIMEMultipart("mixed")
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(strip_tags(html_body), "plain"))
+        alt.attach(MIMEText(html_body, "html"))
+        msg.attach(alt)
+        for filename, filedata in attachments:
+            mime_type, _ = mimetypes.guess_type(filename)
+            maintype, subtype = (mime_type or "application/octet-stream").split("/", 1)
+            part = MIMEBase(maintype, subtype)
+            part.set_payload(filedata)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=filename)
+            msg.attach(part)
+    else:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(strip_tags(html_body), "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+
     msg["Subject"] = subject
     msg["From"]    = f"{sender_name} <{sender_email}>"
     msg["To"]      = to_email
-    msg.attach(MIMEText(strip_tags(html_body), "plain"))
-    msg.attach(MIMEText(html_body, "html"))
     return msg
 
 def send_smtp(cfg, mime_msg):
@@ -217,7 +239,7 @@ def record_unsub(campaign_id, email):
         save_campaigns(c)
         campaigns[campaign_id] = c[campaign_id]
 
-def run_campaign(campaign_id, cfg, recipients, template_str, use_ai, dry_run, base_url=""):
+def run_campaign(campaign_id, cfg, recipients, template_str, use_ai, dry_run, base_url="", attachments=None):
     c = load_campaigns()
     c[campaign_id]["status"] = "running"
     save_campaigns(c)
@@ -265,7 +287,7 @@ def run_campaign(campaign_id, cfg, recipients, template_str, use_ai, dry_run, ba
             if not dry_run:
                 html_body = inject_tracking(html_body, campaign_id, email, base_url)
 
-            mime_msg = build_mime(cfg["smtp_user"], cfg.get("from_name", ""), subject, email, html_body)
+            mime_msg = build_mime(cfg["smtp_user"], cfg.get("from_name", ""), subject, email, html_body, attachments)
 
             if dry_run:
                 preview_dir = Path(f"previews/{campaign_id}")
@@ -300,7 +322,7 @@ def run_campaign(campaign_id, cfg, recipients, template_str, use_ai, dry_run, ba
     save_campaigns(c)
     campaigns[campaign_id] = c[campaign_id]
 
-def schedule_campaign(campaign_id, fire_at, *args):
+def schedule_campaign(campaign_id, fire_at, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments=None):
     delay = (fire_at - datetime.utcnow()).total_seconds()
     if delay > 0:
         c = load_campaigns()
@@ -311,7 +333,7 @@ def schedule_campaign(campaign_id, fire_at, *args):
         time.sleep(delay)
     c = load_campaigns()
     if not c.get(campaign_id, {}).get("cancelled"):
-        run_campaign(campaign_id, *args)
+        run_campaign(campaign_id, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments)
 
 # ── Tracking routes ───────────────────────────────────────────────────────────
 @app.route("/track/open/<campaign_id>/<encoded_email>")
@@ -390,15 +412,23 @@ def parse_csv_route():
 
 @app.route("/api/launch", methods=["POST"])
 def launch():
-    data       = request.json
-    cfg        = data.get("smtp", {})
-    recipients = data.get("recipients", [])
-    template_str = data.get("template", "")
-    use_ai     = data.get("use_ai", False)
-    dry_run    = data.get("dry_run", True)
-    sched      = data.get("scheduled_at", None)
+    import json as _json
+    # Multipart = has attachments; JSON = no attachments
+    if request.content_type and "multipart" in request.content_type:
+        data        = _json.loads(request.form.get("data", "{}"))
+        attachments = [(f.filename, f.read()) for f in request.files.getlist("attachments") if f.filename]
+    else:
+        data        = request.json or {}
+        attachments = []
 
-    if not recipients: return jsonify({"ok": False, "error": "No recipients"}), 400
+    cfg          = data.get("smtp", {})
+    recipients   = data.get("recipients", [])
+    template_str = data.get("template", "")
+    use_ai       = data.get("use_ai", False)
+    dry_run      = data.get("dry_run", True)
+    sched        = data.get("scheduled_at", None)
+
+    if not recipients:   return jsonify({"ok": False, "error": "No recipients"}), 400
     if not template_str: return jsonify({"ok": False, "error": "No template"}), 400
 
     campaign_id = str(uuid.uuid4())[:8]
@@ -410,7 +440,11 @@ def launch():
         "progress": 0, "log": [], "cancelled": False,
         "scheduled_for": sched,
         "created_at": datetime.utcnow().isoformat(),
+        "attachments": [name for name, _ in attachments],
     }
+    if attachments:
+        state["log"].append({"type": "info", "msg": f"📎 {len(attachments)} attachment(s): {', '.join(n for n,_ in attachments)}"})
+
     c = load_campaigns()
     c[campaign_id] = state
     save_campaigns(c)
@@ -420,14 +454,16 @@ def launch():
 
     if sched:
         try:
-            fire_at = datetime.fromisoformat(sched.replace("Z",""))
+            fire_at = datetime.fromisoformat(sched.replace("Z", ""))
             t = threading.Thread(target=schedule_campaign,
-                args=(campaign_id, fire_at, cfg, recipients, template_str, use_ai, dry_run, base_url), daemon=True)
+                args=(campaign_id, fire_at, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments),
+                daemon=True)
         except ValueError:
             return jsonify({"ok": False, "error": "Invalid schedule time"}), 400
     else:
         t = threading.Thread(target=run_campaign,
-            args=(campaign_id, cfg, recipients, template_str, use_ai, dry_run, base_url), daemon=True)
+            args=(campaign_id, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments),
+            daemon=True)
     t.start()
     return jsonify({"ok": True, "campaign_id": campaign_id})
 

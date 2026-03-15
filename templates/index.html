@@ -436,6 +436,23 @@ tr:hover td { background:var(--surface2) }
 .toast.note { border-color:var(--warn) }
 
 /* ════════════════════════════════════════
+   ATTACHMENT PILLS
+════════════════════════════════════════ */
+.attach-pill {
+  display:inline-flex; align-items:center; gap:6px;
+  background:var(--surface); border:1px solid var(--border2);
+  border-radius:6px; padding:4px 10px;
+  font-size:11px; color:var(--text2); font-family:'Inter',sans-serif;
+}
+.attach-pill .rm {
+  background:none; border:none; cursor:pointer;
+  color:var(--text3); font-size:13px; padding:0; line-height:1;
+  transition:color .15s;
+}
+.attach-pill .rm:hover { color:var(--error) }
+.attach-size { color:var(--text3); font-size:10px }
+
+/* ════════════════════════════════════════
    MOBILE
 ════════════════════════════════════════ */
 .mob-bar {
@@ -652,11 +669,20 @@ tr:hover td { background:var(--surface2) }
       <input id="cpick" type="color" style="display:none" onchange="cmd('foreColor',this.value)"/>
       <div class="tb-sep"></div>
       <button class="tb" title="Remove formatting" onclick="cmd('removeFormat')" style="font-size:11px">✕fmt</button>
+      <div class="tb-sep"></div>
+      <button class="tb" title="Attach file" onclick="document.getElementById('attach-input').click()" style="font-size:16px">📎</button>
+      <input id="attach-input" type="file" multiple style="display:none" onchange="addAttachments(this.files)"/>
     </div>
 
     <!-- Editable email body -->
     <div class="editor" id="editor" contenteditable="true"
          data-ph="Start writing your email here…&#10;Click a variable below to personalize it for each recipient.">
+    </div>
+
+    <!-- Attachment list -->
+    <div id="attach-list" style="display:none;padding:10px 16px;border-top:1px solid var(--border);background:var(--surface2);display:none;flex-wrap:wrap;gap:8px;align-items:center">
+      <span style="font-size:11px;font-weight:700;color:var(--text3);letter-spacing:.5px">ATTACHMENTS →</span>
+      <div id="attach-items" style="display:flex;flex-wrap:wrap;gap:7px"></div>
     </div>
 
     <!-- Variable chips -->
@@ -1042,6 +1068,49 @@ function buildSummary(){
 }
 
 // ══════════════════════════════════════════
+// ATTACHMENTS
+// ══════════════════════════════════════════
+let attachedFiles = [];
+
+function addAttachments(files) {
+  for (const f of files) {
+    if (attachedFiles.find(a => a.name === f.name)) continue; // skip dupe
+    attachedFiles.push(f);
+  }
+  renderAttachments();
+}
+
+function removeAttachment(name) {
+  attachedFiles = attachedFiles.filter(f => f.name !== name);
+  renderAttachments();
+}
+
+function renderAttachments() {
+  const list = document.getElementById('attach-list');
+  const items = document.getElementById('attach-items');
+  if (!attachedFiles.length) {
+    list.style.display = 'none';
+    return;
+  }
+  list.style.display = 'flex';
+  items.innerHTML = attachedFiles.map(f => {
+    const kb = (f.size / 1024).toFixed(1);
+    const mb = f.size > 1024*1024 ? (f.size/1024/1024).toFixed(1)+'MB' : kb+'KB';
+    return `<span class="attach-pill">
+      📎 ${f.name} <span class="attach-size">${mb}</span>
+      <button class="rm" onclick="removeAttachment('${f.name}')" title="Remove">✕</button>
+    </span>`;
+  }).join('');
+}
+
+function getFileIcon(name) {
+  const ext = name.split('.').pop().toLowerCase();
+  const map = {pdf:'📄',doc:'📝',docx:'📝',xls:'📊',xlsx:'📊',ppt:'📋',pptx:'📋',
+               jpg:'🖼',jpeg:'🖼',png:'🖼',gif:'🖼',zip:'📦',rar:'📦',mp4:'🎬',mp3:'🎵'};
+  return map[ext] || '📎';
+}
+
+// ══════════════════════════════════════════
 // LAUNCH
 // ══════════════════════════════════════════
 async function launch(){
@@ -1074,10 +1143,19 @@ async function launch(){
   btn.disabled=true; btn.textContent='Launching…';
 
   try{
-    const res=await fetch('/api/launch',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(payload)
-    });
+    let res;
+    if(attachedFiles.length > 0){
+      // Use multipart/form-data when there are attachments
+      const form = new FormData();
+      form.append('data', JSON.stringify(payload));
+      attachedFiles.forEach(f => form.append('attachments', f, f.name));
+      res = await fetch('/api/launch', { method:'POST', body:form });
+    } else {
+      res = await fetch('/api/launch', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(payload)
+      });
+    }
     const d=await res.json();
     if(!d.ok){
       toast('Error: '+d.error,'bad');
@@ -1166,7 +1244,8 @@ async function stop(){
 
 function newCampaign(){
   clearInterval(timer);
-  campaignId=null; rows=[]; cols=[];
+  campaignId=null; rows=[]; cols=[]; attachedFiles=[];
+  renderAttachments();
   document.getElementById('file-preview').style.display='none';
   document.getElementById('btn1').disabled=true;
   document.getElementById('pre-launch').style.display='block';
