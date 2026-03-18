@@ -1,65 +1,32 @@
 """
 LogiMail — Bulk Personalized Email Sender
-Persistent tracking via JSON files (survives server restarts/sleep)
+Full user auth + per-user dashboards via SQLite
 """
-
-import base64
-import csv
-import io
-import json
-import logging
-import os
-import re
-import smtplib
-import threading
-import time
-import uuid
+import base64, csv, hashlib, io, json, logging, os, re, secrets
+import smtplib, sqlite3, threading, time, uuid
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from functools import wraps
 from pathlib import Path
 
-import anthropic
-import openpyxl
-from flask import Flask, Response, jsonify, redirect, render_template, request
+import anthropic, openpyxl
+from flask import (Flask, Response, g, jsonify, redirect,
+                   render_template, request, session, url_for)
 from jinja2 import Template, TemplateError
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
-# ── Persistent storage paths ──────────────────────────────────────────────────
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-CAMPAIGNS_FILE = DATA_DIR / "campaigns.json"
-OPENS_FILE     = DATA_DIR / "opens.json"
-UNSUBS_FILE    = DATA_DIR / "unsubs.json"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
+DB_PATH  = DATA_DIR / "logimail.db"
 
-# ── File-based DB helpers ─────────────────────────────────────────────────────
-_lock = threading.Lock()
-
-def _read(path, default):
-    try:
-        if path.exists():
-            return json.loads(path.read_text())
-    except Exception:
-        pass
-    return default
-
-def _write(path, data):
-    with _lock:
-        path.write_text(json.dumps(data, default=str))
-
-def load_campaigns():   return _read(CAMPAIGNS_FILE, {})
-def save_campaigns(d):  _write(CAMPAIGNS_FILE, d)
-def load_opens():       return _read(OPENS_FILE, {})
-def save_opens(d):      _write(OPENS_FILE, d)
-def load_unsubs():      return {k: set(v) for k, v in _read(UNSUBS_FILE, {}).items()}
-def save_unsubs(d):     _write(UNSUBS_FILE, {k: list(v) for k, v in d.items()})
-
-# ── In-memory cache (backed by files) ────────────────────────────────────────
-campaigns = load_campaigns()
-opens_db  = load_opens()
-unsubs_db = load_unsubs()
+# ── In-memory campaign state (keyed by campaign_id) ───────────────────────────
+_cam_lock  = threading.Lock()
+campaigns  = {}   # campaign_id → state dict
+opens_db   = {}   # campaign_id → [{"email","time","via"}]
+unsubs_db  = {}   # campaign_id → set of emails
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -68,10 +35,163 @@ TRACKING_PIXEL = base64.b64decode(
     "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
 )
 
-# ── File parsers ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE
+# ══════════════════════════════════════════════════════════════════════════════
+def get_db():
+    db = getattr(g, '_db', None)
+    if db is None:
+        db = g._db = sqlite3.connect(DB_PATH)
+        db.row_factory = sqlite3.Row
+    return db
+
+@app.teardown_appcontext
+def close_db(e=None):
+    db = getattr(g, '_db', None)
+    if db: db.close()
+
+def init_db():
+    with app.app_context():
+        db = get_db()
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id        TEXT PRIMARY KEY,
+            email     TEXT UNIQUE NOT NULL,
+            name      TEXT NOT NULL,
+            password  TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS smtp_settings (
+            user_id    TEXT PRIMARY KEY,
+            from_name  TEXT,
+            smtp_host  TEXT,
+            smtp_port  INTEGER DEFAULT 587,
+            smtp_pass  TEXT,
+            delay      REAL DEFAULT 1.5,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS campaign_records (
+            id          TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            status      TEXT,
+            total       INTEGER DEFAULT 0,
+            sent        INTEGER DEFAULT 0,
+            failed      INTEGER DEFAULT 0,
+            skipped     INTEGER DEFAULT 0,
+            opens       INTEGER DEFAULT 0,
+            unsubscribes INTEGER DEFAULT 0,
+            created_at  TEXT,
+            scheduled_for TEXT,
+            attachments TEXT DEFAULT '[]',
+            log_json    TEXT DEFAULT '[]',
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS open_records (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id TEXT NOT NULL,
+            email       TEXT NOT NULL,
+            via         TEXT,
+            opened_at   TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS unsub_records (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id TEXT NOT NULL,
+            email       TEXT NOT NULL UNIQUE,
+            unsubbed_at TEXT NOT NULL
+        );
+        """)
+        db.commit()
+
+init_db()
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            if request.path.startswith('/api/'):
+                return jsonify({"ok": False, "error": "Not authenticated"}), 401
+            return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated
+
+def current_user():
+    uid = session.get('user_id')
+    if not uid: return None
+    return get_db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+
+# ── DB helpers ─────────────────────────────────────────────────────────────────
+def save_campaign_to_db(campaign_id, user_id, state):
+    db = get_db()
+    db.execute("""
+        INSERT OR REPLACE INTO campaign_records
+        (id, user_id, status, total, sent, failed, skipped, opens, unsubscribes,
+         created_at, scheduled_for, attachments, log_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (campaign_id, user_id,
+          state.get("status"), state.get("total",0),
+          state.get("sent",0), state.get("failed",0), state.get("skipped",0),
+          state.get("opens",0), state.get("unsubscribes",0),
+          state.get("created_at"), state.get("scheduled_for"),
+          json.dumps(state.get("attachments",[])),
+          json.dumps(state.get("log",[])[-100:])))
+    db.commit()
+
+def update_campaign_stats(campaign_id, user_id):
+    """Sync in-memory state to DB."""
+    state = campaigns.get(campaign_id)
+    if state: save_campaign_to_db(campaign_id, user_id, state)
+
+def record_open_db(campaign_id, email, via="click"):
+    db = get_db()
+    already = db.execute(
+        "SELECT 1 FROM open_records WHERE campaign_id=? AND email=?",
+        (campaign_id, email)).fetchone()
+    db.execute(
+        "INSERT INTO open_records (campaign_id, email, via, opened_at) VALUES (?,?,?,?)",
+        (campaign_id, email, via, datetime.utcnow().isoformat()))
+    db.commit()
+    unique = db.execute(
+        "SELECT COUNT(DISTINCT email) FROM open_records WHERE campaign_id=?",
+        (campaign_id,)).fetchone()[0]
+    db.execute(
+        "UPDATE campaign_records SET opens=? WHERE id=?", (unique, campaign_id))
+    db.commit()
+    # Update in-memory
+    if campaign_id in campaigns:
+        campaigns[campaign_id]["opens"] = unique
+        if not already:
+            campaigns[campaign_id]["log"].append(
+                {"type":"info","msg":f"👁 Opened by {email}"})
+    return not already
+
+def record_unsub_db(campaign_id, email):
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT OR IGNORE INTO unsub_records (campaign_id, email, unsubbed_at) VALUES (?,?,?)",
+            (campaign_id, email, datetime.utcnow().isoformat()))
+        db.commit()
+    except: pass
+    count = db.execute(
+        "SELECT COUNT(*) FROM unsub_records WHERE campaign_id=?",
+        (campaign_id,)).fetchone()[0]
+    db.execute(
+        "UPDATE campaign_records SET unsubscribes=? WHERE id=?", (count, campaign_id))
+    db.commit()
+    if campaign_id in campaigns:
+        campaigns[campaign_id]["unsubscribes"] = count
+        campaigns[campaign_id]["log"].append(
+            {"type":"warn","msg":f"⊘ Unsubscribed: {email}"})
+    unsubs_db.setdefault(campaign_id, set()).add(email)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FILE PARSERS
+# ══════════════════════════════════════════════════════════════════════════════
 def parse_csv(content):
-    if content.startswith('\ufeff'):
-        content = content[1:]
+    if content.startswith('\ufeff'): content = content[1:]
     reader = csv.DictReader(io.StringIO(content))
     rows = [{k.strip(): str(v or "").strip() for k, v in row.items()} for row in reader]
     return rows, [c.strip() for c in (reader.fieldnames or [])]
@@ -80,35 +200,31 @@ def parse_excel(file_bytes):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb.active
     rows_iter = list(ws.iter_rows(values_only=True))
-    if not rows_iter:
-        return [], []
+    if not rows_iter: return [], []
     headers = [str(h).strip() if h is not None else f"col_{i}" for i, h in enumerate(rows_iter[0])]
     rows = []
     for row in rows_iter[1:]:
         record = {headers[i]: str(v).strip() if v is not None else "" for i, v in enumerate(row)}
-        if any(v for v in record.values()):
-            rows.append(record)
+        if any(v for v in record.values()): rows.append(record)
     wb.close()
     return rows, headers
 
 def parse_file(file):
     name = file.filename.lower()
     data = file.read()
-    if name.endswith(('.xlsx', '.xls')):
-        return parse_excel(data)
-    try:
-        return parse_csv(data.decode('utf-8'))
-    except UnicodeDecodeError:
-        return parse_csv(data.decode('latin-1'))
+    if name.endswith(('.xlsx', '.xls')): return parse_excel(data)
+    try: return parse_csv(data.decode('utf-8'))
+    except UnicodeDecodeError: return parse_csv(data.decode('latin-1'))
 
-# ── Email helpers ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# EMAIL HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 def detect_email(recipient):
     for key in recipient:
-        if key.lower().strip() in ("email", "e-mail", "emailaddress", "email_address", "mail"):
+        if key.lower().strip() in ("email","e-mail","emailaddress","email_address","mail"):
             return recipient[key].strip()
     for val in recipient.values():
-        if "@" in str(val) and "." in str(val):
-            return str(val).strip()
+        if "@" in str(val) and "." in str(val): return str(val).strip()
     return ""
 
 def render_html(tpl, variables):
@@ -119,21 +235,16 @@ def strip_tags(html):
 
 def generate_ai_paragraph(recipient, client):
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=200,
-        messages=[{"role": "user", "content":
+        model="claude-sonnet-4-20250514", max_tokens=200,
+        messages=[{"role":"user","content":
             f"Write a warm, 2-sentence personalised email opening for "
             f"{recipient.get('first_name','the recipient')} who works at "
             f"{recipient.get('company','their company')} as a "
             f"{recipient.get('role','professional')}. "
-            "Be specific, human, no filler. No intro, just the paragraph."
-        }],
-    )
+            "Be specific, human, no filler. No intro, just the paragraph."}])
     return msg.content[0].text.strip()
 
-def enc(s):
-    return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
-
+def enc(s): return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
 def dec(s):
     s += "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s.encode()).decode()
@@ -141,7 +252,7 @@ def dec(s):
 def wrap_links(html_body, campaign_id, encoded_email, base_url):
     def replace_href(match):
         url = match.group(1)
-        if "/track/" in url or url.startswith("mailto:") or url.strip() == "#":
+        if "/track/" in url or url.startswith("mailto:") or url.strip()=="#":
             return match.group(0)
         return f'href="{base_url}/track/click/{campaign_id}/{encoded_email}/{enc(url)}"'
     return re.sub(r'href="([^"]+)"', replace_href, html_body)
@@ -149,30 +260,20 @@ def wrap_links(html_body, campaign_id, encoded_email, base_url):
 def inject_tracking(html_body, campaign_id, email, base_url):
     encoded_email = enc(email)
     unsub_url = f"{base_url}/track/unsub/{campaign_id}/{encoded_email}"
-
     html_body = html_body.replace("{{unsubscribe_link}}", unsub_url)
     html_body = html_body.replace("{{ unsubscribe_link }}", unsub_url)
-
     if "unsubscribe" not in html_body.lower():
-        footer = (
-            f'<div style="text-align:center;padding:16px 12px 8px;font-family:Arial,sans-serif">'
-            f'<a href="{unsub_url}" style="color:#888;font-size:11px;text-decoration:underline">Unsubscribe</a>'
-            f'</div>'
-        )
+        footer = (f'<div style="text-align:center;padding:16px 12px 8px;font-family:Arial,sans-serif">'
+                  f'<a href="{unsub_url}" style="color:#888;font-size:11px;text-decoration:underline">Unsubscribe</a></div>')
         html_body = re.sub(r"</body>", f"{footer}</body>", html_body, flags=re.IGNORECASE) \
                     if re.search(r"</body>", html_body, re.IGNORECASE) else html_body + footer
-
-    # Wrap all links for click tracking (records open on any click)
     html_body = wrap_links(html_body, campaign_id, encoded_email, base_url)
     return html_body
 
 def build_mime(sender_email, sender_name, subject, to_email, html_body, attachments=None):
-    """Build MIME email, optionally with file attachments."""
     from email.mime.base import MIMEBase
     from email import encoders
     import mimetypes
-
-    # Use 'mixed' if attachments exist, else 'alternative'
     if attachments:
         msg = MIMEMultipart("mixed")
         alt = MIMEMultipart("alternative")
@@ -191,10 +292,9 @@ def build_mime(sender_email, sender_name, subject, to_email, html_body, attachme
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(strip_tags(html_body), "plain"))
         msg.attach(MIMEText(html_body, "html"))
-
     msg["Subject"] = subject
-    msg["From"]    = f"{sender_name} <{sender_email}>"
-    msg["To"]      = to_email
+    msg["From"] = f"{sender_name} <{sender_email}>"
+    msg["To"] = to_email
     return msg
 
 def send_smtp(cfg, mime_msg):
@@ -203,357 +303,426 @@ def send_smtp(cfg, mime_msg):
         s.login(cfg["smtp_user"], cfg["smtp_password"])
         s.sendmail(cfg["smtp_user"], mime_msg["To"], mime_msg.as_string())
 
-# ── Campaign runner ───────────────────────────────────────────────────────────
-def record_open(campaign_id, email, via="click"):
-    """Record an open event and persist it."""
-    opens = load_opens()
-    if campaign_id not in opens:
-        opens[campaign_id] = []
-    already = any(o["email"] == email for o in opens[campaign_id])
-    opens[campaign_id].append({"email": email, "time": datetime.utcnow().isoformat(), "via": via})
-    save_opens(opens)
-    opens_db[campaign_id] = opens[campaign_id]
+# ══════════════════════════════════════════════════════════════════════════════
+# CAMPAIGN RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+def run_campaign(campaign_id, user_id, cfg, recipients, template_str,
+                 use_ai, dry_run, base_url="", attachments=None):
+    with app.app_context():
+        state = campaigns[campaign_id]
+        state["status"] = "running"
+        save_campaign_to_db(campaign_id, user_id, state)
 
-    # Update campaign stats
-    c = load_campaigns()
-    if campaign_id in c:
-        unique = len(set(o["email"] for o in opens[campaign_id]))
-        c[campaign_id]["opens"] = unique
-        if not already:
-            c[campaign_id]["log"].append({"type": "info", "msg": f"👁 Opened by {email}"})
-        save_campaigns(c)
-        campaigns[campaign_id] = c[campaign_id]
-    return not already
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        ai_client = anthropic.Anthropic(api_key=api_key) if (use_ai and api_key) else None
+        if use_ai and not api_key:
+            state["log"].append({"type":"warn","msg":"⚠️ AI skipped — ANTHROPIC_API_KEY not set."})
 
-def record_unsub(campaign_id, email):
-    """Record unsubscribe and persist it."""
-    unsubs = load_unsubs()
-    unsubs.setdefault(campaign_id, set()).add(email)
-    save_unsubs(unsubs)
-    unsubs_db[campaign_id] = unsubs[campaign_id]
+        for i, recipient in enumerate(recipients):
+            if state.get("cancelled"):
+                state["status"] = "cancelled"; break
 
-    c = load_campaigns()
-    if campaign_id in c:
-        c[campaign_id]["unsubscribes"] = len(unsubs[campaign_id])
-        c[campaign_id]["log"].append({"type": "warn", "msg": f"⊘ Unsubscribed: {email}"})
-        save_campaigns(c)
-        campaigns[campaign_id] = c[campaign_id]
+            email = detect_email(recipient)
+            state["current"] = i + 1
+            state["current_email"] = email
 
-def run_campaign(campaign_id, cfg, recipients, template_str, use_ai, dry_run, base_url="", attachments=None):
-    c = load_campaigns()
-    c[campaign_id]["status"] = "running"
-    save_campaigns(c)
-    campaigns[campaign_id] = c[campaign_id]
+            db = get_db()
+            is_unsubbed = db.execute(
+                "SELECT 1 FROM unsub_records WHERE campaign_id=? AND email=?",
+                (campaign_id, email)).fetchone()
+            if is_unsubbed:
+                state["skipped"] += 1
+                state["log"].append({"type":"warn","msg":f"Skipped unsubscribed: {email}"}); continue
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    ai_client = anthropic.Anthropic(api_key=api_key) if (use_ai and api_key) else None
-    if use_ai and not api_key:
-        c[campaign_id]["log"].append({"type": "warn", "msg": "⚠️ AI skipped — ANTHROPIC_API_KEY not set."})
+            if not email or "@" not in email:
+                state["skipped"] += 1
+                state["log"].append({"type":"warn","msg":f"Row {i+1}: No valid email"}); continue
 
-    for i, recipient in enumerate(recipients):
-        c = load_campaigns()
-        if c.get(campaign_id, {}).get("cancelled"):
-            c[campaign_id]["status"] = "cancelled"
-            save_campaigns(c)
-            campaigns[campaign_id] = c[campaign_id]
-            break
+            try:
+                if use_ai and ai_client:
+                    recipient["ai_paragraph"] = generate_ai_paragraph(recipient, ai_client)
+                subject   = render_html(cfg.get("subject_template","Hello"), recipient)
+                html_body = render_html(template_str, recipient)
+                if not dry_run:
+                    html_body = inject_tracking(html_body, campaign_id, email, base_url)
+                mime_msg = build_mime(cfg["smtp_user"], cfg.get("from_name",""),
+                                      subject, email, html_body, attachments)
+                if dry_run:
+                    preview_dir = Path(f"previews/{campaign_id}"); preview_dir.mkdir(parents=True, exist_ok=True)
+                    (preview_dir / f"{email.replace('@','_at_').replace('.','_')}.html").write_text(html_body)
+                    state["log"].append({"type":"info","msg":f"✓ Preview saved for {email}"})
+                else:
+                    send_smtp(cfg, mime_msg)
+                    state["log"].append({"type":"success","msg":f"✓ Sent to {email}"})
+                state["sent"] += 1
+            except TemplateError as e:
+                state["failed"] += 1
+                state["log"].append({"type":"error","msg":f"Template error for {email}: {e}"})
+            except smtplib.SMTPException as e:
+                state["failed"] += 1
+                state["log"].append({"type":"error","msg":f"SMTP error for {email}: {e}"})
+            except Exception as e:
+                state["failed"] += 1
+                state["log"].append({"type":"error","msg":f"Error for {email}: {e}"})
 
-        email = detect_email(recipient)
-        c[campaign_id]["current"] = i + 1
-        c[campaign_id]["current_email"] = email
+            if i % 5 == 0: save_campaign_to_db(campaign_id, user_id, state)
+            time.sleep(float(cfg.get("delay_seconds", 1.0)))
 
-        unsubs = load_unsubs()
-        if email in unsubs.get(campaign_id, set()):
-            c[campaign_id]["skipped"] = c[campaign_id].get("skipped", 0) + 1
-            c[campaign_id]["log"].append({"type": "warn", "msg": f"Skipped unsubscribed: {email}"})
-            save_campaigns(c)
-            campaigns[campaign_id] = c[campaign_id]
-            continue
+        if not state.get("cancelled"): state["status"] = "done"
+        state["progress"] = 100
+        save_campaign_to_db(campaign_id, user_id, state)
 
-        if not email or "@" not in email:
-            c[campaign_id]["skipped"] = c[campaign_id].get("skipped", 0) + 1
-            c[campaign_id]["log"].append({"type": "warn", "msg": f"Row {i+1}: No valid email. Columns: {list(recipient.keys())}"})
-            save_campaigns(c)
-            campaigns[campaign_id] = c[campaign_id]
-            continue
+def schedule_campaign(campaign_id, user_id, fire_at, *args):
+    with app.app_context():
+        delay = (fire_at - datetime.utcnow()).total_seconds()
+        if delay > 0:
+            campaigns[campaign_id]["status"] = "scheduled"
+            campaigns[campaign_id]["log"].append(
+                {"type":"info","msg":f"⏰ Scheduled for {fire_at.strftime('%Y-%m-%d %H:%M UTC')}"})
+            save_campaign_to_db(campaign_id, user_id, campaigns[campaign_id])
+            time.sleep(delay)
+        if not campaigns.get(campaign_id, {}).get("cancelled"):
+            run_campaign(campaign_id, user_id, *args)
 
-        try:
-            if use_ai and ai_client:
-                recipient["ai_paragraph"] = generate_ai_paragraph(recipient, ai_client)
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTH PAGES
+# ══════════════════════════════════════════════════════════════════════════════
+@app.route("/login")
+def login_page():
+    if 'user_id' in session: return redirect('/')
+    return render_template("auth.html", mode="login")
 
-            subject   = render_html(cfg.get("subject_template", "Hello"), recipient)
-            html_body = render_html(template_str, recipient)
+@app.route("/register")
+def register_page():
+    if 'user_id' in session: return redirect('/')
+    return render_template("auth.html", mode="register")
 
-            if not dry_run:
-                html_body = inject_tracking(html_body, campaign_id, email, base_url)
+@app.route("/api/auth/register", methods=["POST"])
+def register():
+    d = request.json or {}
+    name  = (d.get("name","")).strip()
+    email = (d.get("email","")).strip().lower()
+    pw    = d.get("password","")
+    if not name or not email or not pw:
+        return jsonify({"ok":False,"error":"All fields are required"}), 400
+    if len(pw) < 6:
+        return jsonify({"ok":False,"error":"Password must be at least 6 characters"}), 400
+    db = get_db()
+    if db.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
+        return jsonify({"ok":False,"error":"An account with this email already exists"}), 400
+    uid = str(uuid.uuid4())[:12]
+    db.execute("INSERT INTO users (id,email,name,password,created_at) VALUES (?,?,?,?,?)",
+               (uid, email, name, hash_pw(pw), datetime.utcnow().isoformat()))
+    db.commit()
+    session['user_id']   = uid
+    session['user_email'] = email
+    session['user_name']  = name
+    return jsonify({"ok":True,"name":name,"email":email})
 
-            mime_msg = build_mime(cfg["smtp_user"], cfg.get("from_name", ""), subject, email, html_body, attachments)
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    d = request.json or {}
+    email = (d.get("email","")).strip().lower()
+    pw    = d.get("password","")
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE email=? AND password=?",
+                      (email, hash_pw(pw))).fetchone()
+    if not user:
+        return jsonify({"ok":False,"error":"Invalid email or password"}), 401
+    session['user_id']   = user['id']
+    session['user_email'] = user['email']
+    session['user_name']  = user['name']
+    return jsonify({"ok":True,"name":user['name'],"email":user['email']})
 
-            if dry_run:
-                preview_dir = Path(f"previews/{campaign_id}")
-                preview_dir.mkdir(parents=True, exist_ok=True)
-                safe = email.replace("@", "_at_").replace(".", "_")
-                (preview_dir / f"{safe}.html").write_text(html_body)
-                c[campaign_id]["log"].append({"type": "info", "msg": f"✓ Preview saved for {email}"})
-            else:
-                send_smtp(cfg, mime_msg)
-                c[campaign_id]["log"].append({"type": "success", "msg": f"✓ Sent to {email}"})
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"ok":True})
 
-            c[campaign_id]["sent"] = c[campaign_id].get("sent", 0) + 1
+@app.route("/api/auth/me")
+def me():
+    if 'user_id' not in session:
+        return jsonify({"ok":False}), 401
+    return jsonify({"ok":True,"name":session.get('user_name'),
+                    "email":session.get('user_email')})
 
-        except TemplateError as e:
-            c[campaign_id]["failed"] = c[campaign_id].get("failed", 0) + 1
-            c[campaign_id]["log"].append({"type": "error", "msg": f"Template error for {email}: {e}"})
-        except smtplib.SMTPException as e:
-            c[campaign_id]["failed"] = c[campaign_id].get("failed", 0) + 1
-            c[campaign_id]["log"].append({"type": "error", "msg": f"SMTP error for {email}: {e}"})
-        except Exception as e:
-            c[campaign_id]["failed"] = c[campaign_id].get("failed", 0) + 1
-            c[campaign_id]["log"].append({"type": "error", "msg": f"Error for {email}: {e}"})
+# ══════════════════════════════════════════════════════════════════════════════
+# SMTP SETTINGS (saved per user)
+# ══════════════════════════════════════════════════════════════════════════════
+@app.route("/api/smtp-settings", methods=["GET"])
+@login_required
+def get_smtp():
+    db = get_db()
+    row = db.execute("SELECT * FROM smtp_settings WHERE user_id=?",
+                     (session['user_id'],)).fetchone()
+    if not row:
+        return jsonify({"ok":True,"settings":{}})
+    return jsonify({"ok":True,"settings":{
+        "from_name": row['from_name'],
+        "smtp_host": row['smtp_host'],
+        "smtp_port": row['smtp_port'],
+        "delay":     row['delay'],
+        # Never return the password
+    }})
 
-        save_campaigns(c)
-        campaigns[campaign_id] = c[campaign_id]
-        time.sleep(float(cfg.get("delay_seconds", 1.0)))
+@app.route("/api/smtp-settings", methods=["POST"])
+@login_required
+def save_smtp():
+    d = request.json or {}
+    db = get_db()
+    existing = db.execute("SELECT 1 FROM smtp_settings WHERE user_id=?",
+                           (session['user_id'],)).fetchone()
+    if existing:
+        # Only update password if provided
+        if d.get("smtp_pass"):
+            db.execute("""UPDATE smtp_settings SET
+                from_name=?,smtp_host=?,smtp_port=?,smtp_pass=?,delay=? WHERE user_id=?""",
+                (d.get("from_name"), d.get("smtp_host"), d.get("smtp_port",587),
+                 d.get("smtp_pass"), d.get("delay",1.5), session['user_id']))
+        else:
+            db.execute("""UPDATE smtp_settings SET
+                from_name=?,smtp_host=?,smtp_port=?,delay=? WHERE user_id=?""",
+                (d.get("from_name"), d.get("smtp_host"), d.get("smtp_port",587),
+                 d.get("delay",1.5), session['user_id']))
+    else:
+        db.execute("""INSERT INTO smtp_settings (user_id,from_name,smtp_host,smtp_port,smtp_pass,delay)
+            VALUES (?,?,?,?,?,?)""",
+            (session['user_id'], d.get("from_name"), d.get("smtp_host"),
+             d.get("smtp_port",587), d.get("smtp_pass"), d.get("delay",1.5)))
+    db.commit()
+    return jsonify({"ok":True})
 
-    c = load_campaigns()
-    if not c.get(campaign_id, {}).get("cancelled"):
-        c[campaign_id]["status"] = "done"
-    c[campaign_id]["progress"] = 100
-    save_campaigns(c)
-    campaigns[campaign_id] = c[campaign_id]
-
-def schedule_campaign(campaign_id, fire_at, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments=None):
-    delay = (fire_at - datetime.utcnow()).total_seconds()
-    if delay > 0:
-        c = load_campaigns()
-        c[campaign_id]["status"] = "scheduled"
-        c[campaign_id]["log"].append({"type": "info", "msg": f"⏰ Scheduled for {fire_at.strftime('%Y-%m-%d %H:%M UTC')}"})
-        save_campaigns(c)
-        campaigns[campaign_id] = c[campaign_id]
-        time.sleep(delay)
-    c = load_campaigns()
-    if not c.get(campaign_id, {}).get("cancelled"):
-        run_campaign(campaign_id, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments)
-
-# ── Tracking routes ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# TRACKING ROUTES (no login required — accessed from emails)
+# ══════════════════════════════════════════════════════════════════════════════
 @app.route("/track/open/<campaign_id>/<encoded_email>")
 def track_open(campaign_id, encoded_email):
     try:
-        email = dec(encoded_email)
-        record_open(campaign_id, email, via="pixel")
-    except Exception as e:
-        log.warning(f"track_open: {e}")
+        with app.app_context():
+            email = dec(encoded_email)
+            record_open_db(campaign_id, email, via="pixel")
+    except Exception as e: log.warning(f"track_open: {e}")
     return Response(TRACKING_PIXEL, mimetype="image/gif",
-                    headers={"Cache-Control": "no-store, no-cache", "Pragma": "no-cache"})
+                    headers={"Cache-Control":"no-store,no-cache","Pragma":"no-cache"})
 
 @app.route("/track/click/<campaign_id>/<encoded_email>/<encoded_url>")
 def track_click(campaign_id, encoded_email, encoded_url):
     original_url = "/"
     try:
-        email = dec(encoded_email)
-        original_url = dec(encoded_url)
-        record_open(campaign_id, email, via="click")
-        log.info(f"Click: {email} → {original_url}")
-    except Exception as e:
-        log.warning(f"track_click: {e}")
+        with app.app_context():
+            email = dec(encoded_email)
+            original_url = dec(encoded_url)
+            record_open_db(campaign_id, email, via="click")
+    except Exception as e: log.warning(f"track_click: {e}")
     return redirect(original_url, code=302)
 
 @app.route("/track/unsub/<campaign_id>/<encoded_email>")
 def track_unsub(campaign_id, encoded_email):
     try:
-        email = dec(encoded_email)
-        # Unsubscribe = definite open, record it first
-        record_open(campaign_id, email, via="unsubscribe")
-        record_unsub(campaign_id, email)
-        log.info(f"Unsub + open recorded: {email}")
-    except Exception as e:
-        log.warning(f"track_unsub: {e}")
+        with app.app_context():
+            email = dec(encoded_email)
+            record_open_db(campaign_id, email, via="unsubscribe")
+            record_unsub_db(campaign_id, email)
+    except Exception as e: log.warning(f"track_unsub: {e}")
     return """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Unsubscribed</title>
 <style>*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',Arial,sans-serif;background:#0a0f0b;
-     display:flex;align-items:center;justify-content:center;min-height:100vh}
-.card{background:#111a13;border:1px solid #243028;border-radius:16px;
+body{font-family:'Segoe UI',sans-serif;background:#0b0f0c;display:flex;
+     align-items:center;justify-content:center;min-height:100vh}
+.card{background:#121712;border:1px solid #2a3a2c;border-radius:16px;
       padding:48px 40px;text-align:center;max-width:400px;width:90%}
 .icon{font-size:48px;margin-bottom:16px}
-h2{color:#3ecf6e;font-size:22px;margin-bottom:8px;font-weight:600}
-p{color:#627a68;font-size:14px;line-height:1.6}</style></head>
+h2{color:#22c55e;font-size:22px;margin-bottom:8px;font-weight:700}
+p{color:#6b8a6e;font-size:14px;line-height:1.6}</style></head>
 <body><div class="card"><div class="icon">✅</div>
 <h2>Successfully Unsubscribed</h2>
 <p>You have been removed from this mailing list.</p>
 </div></body></html>"""
 
-# ── API routes ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN APP ROUTES
+# ══════════════════════════════════════════════════════════════════════════════
 @app.route("/")
+@login_required
 def index():
     return render_template("index.html")
 
 @app.route("/api/preview-template", methods=["POST"])
+@login_required
 def preview_template():
     data = request.json
     try:
-        return jsonify({"ok": True, "html": render_html(data.get("template",""), data.get("sample",{}))})
+        return jsonify({"ok":True,"html":render_html(data.get("template",""),data.get("sample",{}))})
     except TemplateError as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+        return jsonify({"ok":False,"error":str(e)}), 400
 
 @app.route("/api/parse-csv", methods=["POST"])
+@login_required
 def parse_csv_route():
     file = request.files.get("file")
-    if not file:
-        return jsonify({"ok": False, "error": "No file"}), 400
+    if not file: return jsonify({"ok":False,"error":"No file"}), 400
     try:
         rows, columns = parse_file(file)
-        if not rows:
-            return jsonify({"ok": False, "error": "File appears empty"}), 400
-        return jsonify({"ok": True, "columns": columns, "count": len(rows), "sample": rows[:3], "rows": rows})
+        if not rows: return jsonify({"ok":False,"error":"File appears empty"}), 400
+        return jsonify({"ok":True,"columns":columns,"count":len(rows),"sample":rows[:3],"rows":rows})
     except Exception as e:
-        return jsonify({"ok": False, "error": f"Could not read file: {e}"}), 400
+        return jsonify({"ok":False,"error":f"Could not read file: {e}"}), 400
 
 @app.route("/api/launch", methods=["POST"])
+@login_required
 def launch():
     import json as _json
-    # Multipart = has attachments; JSON = no attachments
     if request.content_type and "multipart" in request.content_type:
-        data        = _json.loads(request.form.get("data", "{}"))
+        data        = _json.loads(request.form.get("data","{}"))
         attachments = [(f.filename, f.read()) for f in request.files.getlist("attachments") if f.filename]
     else:
         data        = request.json or {}
         attachments = []
 
-    cfg          = data.get("smtp", {})
-    recipients   = data.get("recipients", [])
-    template_str = data.get("template", "")
-    use_ai       = data.get("use_ai", False)
-    dry_run      = data.get("dry_run", True)
-    sched        = data.get("scheduled_at", None)
+    cfg          = data.get("smtp",{})
+    recipients   = data.get("recipients",[])
+    template_str = data.get("template","")
+    use_ai       = data.get("use_ai",False)
+    dry_run      = data.get("dry_run",True)
+    sched        = data.get("scheduled_at",None)
+    user_id      = session['user_id']
+    user_email   = session['user_email']
 
-    if not recipients:   return jsonify({"ok": False, "error": "No recipients"}), 400
-    if not template_str: return jsonify({"ok": False, "error": "No template"}), 400
+    if not recipients:   return jsonify({"ok":False,"error":"No recipients"}), 400
+    if not template_str: return jsonify({"ok":False,"error":"No template"}), 400
+
+    # Use account email as sender
+    cfg["smtp_user"] = user_email
+
+    # Load saved SMTP password if not provided
+    if not cfg.get("smtp_password"):
+        db = get_db()
+        row = db.execute("SELECT smtp_pass FROM smtp_settings WHERE user_id=?", (user_id,)).fetchone()
+        if row and row['smtp_pass']: cfg["smtp_password"] = row['smtp_pass']
+
+    # Save SMTP settings for next time
+    if cfg.get("smtp_host"):
+        db = get_db()
+        existing = db.execute("SELECT 1 FROM smtp_settings WHERE user_id=?",(user_id,)).fetchone()
+        if existing:
+            if cfg.get("smtp_password"):
+                db.execute("UPDATE smtp_settings SET from_name=?,smtp_host=?,smtp_port=?,smtp_pass=?,delay=? WHERE user_id=?",
+                    (cfg.get("from_name"),cfg.get("smtp_host"),cfg.get("smtp_port",587),
+                     cfg.get("smtp_password"),cfg.get("delay_seconds",1.5),user_id))
+            else:
+                db.execute("UPDATE smtp_settings SET from_name=?,smtp_host=?,smtp_port=?,delay=? WHERE user_id=?",
+                    (cfg.get("from_name"),cfg.get("smtp_host"),cfg.get("smtp_port",587),
+                     cfg.get("delay_seconds",1.5),user_id))
+        else:
+            db.execute("INSERT INTO smtp_settings (user_id,from_name,smtp_host,smtp_port,smtp_pass,delay) VALUES (?,?,?,?,?,?)",
+                (user_id,cfg.get("from_name"),cfg.get("smtp_host"),cfg.get("smtp_port",587),
+                 cfg.get("smtp_password"),cfg.get("delay_seconds",1.5)))
+        db.commit()
 
     campaign_id = str(uuid.uuid4())[:8]
     state = {
-        "status": "pending", "total": len(recipients),
-        "sent": 0, "failed": 0, "skipped": 0,
-        "opens": 0, "unsubscribes": 0,
-        "current": 0, "current_email": "",
-        "progress": 0, "log": [], "cancelled": False,
-        "scheduled_for": sched,
-        "created_at": datetime.utcnow().isoformat(),
-        "attachments": [name for name, _ in attachments],
+        "status":"pending","total":len(recipients),
+        "sent":0,"failed":0,"skipped":0,"opens":0,"unsubscribes":0,
+        "current":0,"current_email":"","progress":0,"log":[],
+        "cancelled":False,"scheduled_for":sched,
+        "created_at":datetime.utcnow().isoformat(),
+        "attachments":[name for name,_ in attachments],
     }
     if attachments:
-        state["log"].append({"type": "info", "msg": f"📎 {len(attachments)} attachment(s): {', '.join(n for n,_ in attachments)}"})
+        state["log"].append({"type":"info","msg":f"📎 {len(attachments)} attachment(s): {', '.join(n for n,_ in attachments)}"})
 
-    c = load_campaigns()
-    c[campaign_id] = state
-    save_campaigns(c)
     campaigns[campaign_id] = state
-
+    save_campaign_to_db(campaign_id, user_id, state)
     base_url = request.host_url.rstrip("/")
 
     if sched:
         try:
-            fire_at = datetime.fromisoformat(sched.replace("Z", ""))
+            fire_at = datetime.fromisoformat(sched.replace("Z",""))
             t = threading.Thread(target=schedule_campaign,
-                args=(campaign_id, fire_at, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments),
+                args=(campaign_id, user_id, fire_at, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments),
                 daemon=True)
         except ValueError:
-            return jsonify({"ok": False, "error": "Invalid schedule time"}), 400
+            return jsonify({"ok":False,"error":"Invalid schedule time"}), 400
     else:
         t = threading.Thread(target=run_campaign,
-            args=(campaign_id, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments),
+            args=(campaign_id, user_id, cfg, recipients, template_str, use_ai, dry_run, base_url, attachments),
             daemon=True)
     t.start()
-    return jsonify({"ok": True, "campaign_id": campaign_id})
+    return jsonify({"ok":True,"campaign_id":campaign_id})
 
 @app.route("/api/status/<campaign_id>")
+@login_required
 def status(campaign_id):
-    # Always read from file so we get latest opens/unsubs even after restart
-    c = load_campaigns()
-    state = c.get(campaign_id)
+    # First check in-memory (running campaigns)
+    state = campaigns.get(campaign_id)
     if not state:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    total = state["total"]
-    done  = state.get("sent",0) + state.get("failed",0) + state.get("skipped",0)
-    state["progress"] = int((done / total) * 100) if total else 0
-    # Sync latest opens/unsubs from their own files
-    opens  = load_opens()
-    unsubs = load_unsubs()
-    state["opens"]        = len(set(o["email"] for o in opens.get(campaign_id, [])))
-    state["unsubscribes"] = len(unsubs.get(campaign_id, set()))
-    return jsonify({"ok": True, **state})
+        # Fall back to DB
+        db = get_db()
+        row = db.execute("SELECT * FROM campaign_records WHERE id=? AND user_id=?",
+                         (campaign_id, session['user_id'])).fetchone()
+        if not row: return jsonify({"ok":False,"error":"Not found"}), 404
+        state = dict(row)
+        state['log'] = json.loads(row['log_json'] or '[]')
+        state['attachments'] = json.loads(row['attachments'] or '[]')
+    total = state.get("total",0)
+    done  = state.get("sent",0)+state.get("failed",0)+state.get("skipped",0)
+    state["progress"] = int((done/total)*100) if total else 0
+    # Freshen opens/unsubs from DB
+    db = get_db()
+    opens = db.execute("SELECT COUNT(DISTINCT email) FROM open_records WHERE campaign_id=?",(campaign_id,)).fetchone()[0]
+    unsubs = db.execute("SELECT COUNT(*) FROM unsub_records WHERE campaign_id=?",(campaign_id,)).fetchone()[0]
+    state["opens"] = opens; state["unsubscribes"] = unsubs
+    return jsonify({"ok":True,**state})
 
 @app.route("/api/cancel/<campaign_id>", methods=["POST"])
+@login_required
 def cancel(campaign_id):
-    c = load_campaigns()
-    if campaign_id in c:
-        c[campaign_id]["cancelled"] = True
-        save_campaigns(c)
-        campaigns[campaign_id] = c[campaign_id]
-    return jsonify({"ok": True})
+    state = campaigns.get(campaign_id)
+    if state: state["cancelled"] = True
+    return jsonify({"ok":True})
 
 @app.route("/api/campaigns")
+@login_required
 def list_campaigns():
-    c = load_campaigns()
-    opens  = load_opens()
-    unsubs = load_unsubs()
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM campaign_records WHERE user_id=? ORDER BY created_at DESC",
+        (session['user_id'],)).fetchall()
     result = []
-    for cid, state in c.items():
+    for row in rows:
+        opens  = db.execute("SELECT COUNT(DISTINCT email) FROM open_records WHERE campaign_id=?",(row['id'],)).fetchone()[0]
+        unsubs = db.execute("SELECT COUNT(*) FROM unsub_records WHERE campaign_id=?",(row['id'],)).fetchone()[0]
+        # Merge with live in-memory state if running
+        live = campaigns.get(row['id'],{})
         result.append({
-            "id": cid,
-            "status": state.get("status"),
-            "total": state.get("total", 0),
-            "sent": state.get("sent", 0),
-            "failed": state.get("failed", 0),
-            "opens": len(set(o["email"] for o in opens.get(cid, []))),
-            "unsubscribes": len(unsubs.get(cid, set())),
-            "created_at": state.get("created_at", ""),
-            "scheduled_for": state.get("scheduled_for", ""),
+            "id":row['id'],
+            "status": live.get("status",row['status']),
+            "total":  live.get("total", row['total']),
+            "sent":   live.get("sent",  row['sent']),
+            "failed": live.get("failed",row['failed']),
+            "opens":  opens, "unsubscribes": unsubs,
+            "created_at":   row['created_at'],
+            "scheduled_for":row['scheduled_for'],
         })
-    return jsonify({"ok": True, "campaigns": sorted(result, key=lambda x: x["created_at"], reverse=True)})
-
+    return jsonify({"ok":True,"campaigns":result})
 
 @app.route("/api/campaigns/<campaign_id>", methods=["DELETE"])
+@login_required
 def delete_campaign(campaign_id):
-    """Delete a campaign and all its tracking data."""
-    c = load_campaigns()
-    if campaign_id not in c:
-        return jsonify({"ok": False, "error": "Campaign not found"}), 404
-
-    # Don't allow deleting a running campaign
-    if c[campaign_id].get("status") == "running":
-        return jsonify({"ok": False, "error": "Cannot delete a running campaign. Stop it first."}), 400
-
-    # Remove from all stores
-    del c[campaign_id]
-    save_campaigns(c)
-
-    opens = load_opens()
-    if campaign_id in opens:
-        del opens[campaign_id]
-        save_opens(opens)
-
-    unsubs = load_unsubs()
-    if campaign_id in unsubs:
-        del unsubs[campaign_id]
-        save_unsubs(unsubs)
-
-    # Also remove from in-memory cache
-    campaigns.pop(campaign_id, None)
-    opens_db.pop(campaign_id, None)
-    unsubs_db.pop(campaign_id, None)
-
-    log.info(f"Campaign {campaign_id} deleted")
-    return jsonify({"ok": True})
-
-@app.route("/api/opens/<campaign_id>")
-def get_opens(campaign_id):
-    return jsonify({"ok": True, "opens": load_opens().get(campaign_id, [])})
-
-@app.route("/api/unsubs/<campaign_id>")
-def get_unsubs(campaign_id):
-    return jsonify({"ok": True, "unsubs": list(load_unsubs().get(campaign_id, set()))})
+    db = get_db()
+    row = db.execute("SELECT 1 FROM campaign_records WHERE id=? AND user_id=?",
+                     (campaign_id, session['user_id'])).fetchone()
+    if not row: return jsonify({"ok":False,"error":"Campaign not found"}), 404
+    live = campaigns.get(campaign_id,{})
+    if live.get("status") == "running":
+        return jsonify({"ok":False,"error":"Stop the campaign before deleting"}), 400
+    db.execute("DELETE FROM campaign_records WHERE id=?",(campaign_id,))
+    db.execute("DELETE FROM open_records WHERE campaign_id=?",(campaign_id,))
+    db.execute("DELETE FROM unsub_records WHERE campaign_id=?",(campaign_id,))
+    db.commit()
+    campaigns.pop(campaign_id,None)
+    return jsonify({"ok":True})
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

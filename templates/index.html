@@ -632,10 +632,16 @@ tr:hover td { background:var(--surface2) }
   </nav>
 
   <div class="sidebar-foot">
+    <!-- User info -->
+    <div style="padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);margin-bottom:8px">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:2px;letter-spacing:.5px;text-transform:uppercase">Signed in as</div>
+      <div style="font-size:13px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" id="user-display">—</div>
+      <button onclick="logout()" style="margin-top:8px;width:100%;padding:6px;border-radius:7px;border:1px solid var(--border);background:none;color:var(--text3);font-size:11px;cursor:pointer;font-family:'Inter',sans-serif;font-weight:500;transition:all .15s" onmouseover="this.style.borderColor='var(--error)';this.style.color='var(--error)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">Sign Out</button>
+    </div>
     <button class="theme-btn" onclick="toggleTheme()" id="theme-btn">
       <span id="th-icon">🌙</span><span id="th-label">Dark mode</span>
     </button>
-    <div class="powered">Developer: Logical</div>
+    <div class="powered">v2.0 · powered by Claude AI</div>
   </div>
 </aside>
 
@@ -1477,26 +1483,59 @@ async function deleteCampaign(id, btn){
 }
 
 // ══════════════════════════════════════════
+// LOGOUT
+// ══════════════════════════════════════════
+async function logout(){
+  if(!confirm('Sign out of LogiMail?')) return;
+  await fetch('/api/auth/logout',{method:'POST'});
+  window.location.href='/login';
+}
+
+// ══════════════════════════════════════════
 // RESTORE STATE ON PAGE LOAD
 // ══════════════════════════════════════════
-window.addEventListener('DOMContentLoaded',()=>{
-  // Theme
+window.addEventListener('DOMContentLoaded',async ()=>{
   syncTheme(localStorage.getItem('lm-theme')||'dark');
 
-  // Settings
+  // Load user info & verify session
+  try{
+    const res=await fetch('/api/auth/me');
+    const d=await res.json();
+    if(d.ok){
+      document.getElementById('user-display').textContent=d.name+' · '+d.email;
+      document.getElementById('smtp-user').value=d.email;
+      document.getElementById('smtp-user').readOnly=true;
+      document.getElementById('smtp-user').style.opacity='0.7';
+      document.getElementById('smtp-user').title='Your account email is used as the sender';
+    } else { window.location.href='/login'; return; }
+  }catch(e){ window.location.href='/login'; return; }
+
+  // Load saved SMTP settings from server
+  try{
+    const res=await fetch('/api/smtp-settings');
+    const d=await res.json();
+    if(d.ok&&d.settings){
+      const s=d.settings;
+      if(s.from_name&&!SS.load('settings',{}).fromName) document.getElementById('from-name').value=s.from_name;
+      if(s.smtp_host&&!SS.load('settings',{}).smtpHost) document.getElementById('smtp-host').value=s.smtp_host;
+      if(s.smtp_port&&!SS.load('settings',{}).smtpPort) document.getElementById('smtp-port').value=s.smtp_port;
+      if(s.delay&&!SS.load('settings',{}).delay) document.getElementById('delay').value=s.delay;
+    }
+  }catch(e){}
+
+  // Restore from sessionStorage
   loadSettings();
 
   // File data
-  const sr=SS.load('rows',[]), sc=SS.load('cols',[]);
-  const sfn=SS.load('fname',''), ss=SS.load('sample',[]);
-  if(sr.length&&sc.length){ rows=sr; cols=sc; renderFilePreview(sc,sr.length,sfn,ss); }
+  const sr=SS.load('rows',[]),sc=SS.load('cols',[]);
+  const sfn=SS.load('fname',''),ss=SS.load('sample',[]);
+  if(sr.length&&sc.length){rows=sr;cols=sc;renderFilePreview(sc,sr.length,sfn,ss);}
 
   // Editor
-  const eh=SS.load('editorHTML',''), es=SS.load('subject','');
+  const eh=SS.load('editorHTML',''),es=SS.load('subject','');
   if(eh) document.getElementById('editor').innerHTML=eh;
   if(es) document.getElementById('subject').value=es;
 
-  // Editor auto-save
   document.getElementById('editor').addEventListener('input',saveEditorState);
   document.getElementById('subject').addEventListener('input',saveEditorState);
 
@@ -1509,11 +1548,9 @@ window.addEventListener('DOMContentLoaded',()=>{
     fetchStatus().then(()=>startPoll());
   }
 
-  // Settings listeners
-  ['from-name','smtp-user','smtp-host','smtp-port','send-mode','delay']
+  ['from-name','smtp-host','smtp-port','send-mode','delay']
     .forEach(id=>document.getElementById(id).addEventListener('change',saveSettings));
 
-  // Restore page (last)
   goTo(SS.load('page',0));
 });
 {% endraw %}
