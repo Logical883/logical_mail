@@ -17,6 +17,7 @@ from jinja2 import Template, TemplateError
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB limit
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
@@ -84,6 +85,8 @@ def init_db():
             scheduled_for TEXT,
             attachments TEXT DEFAULT '[]',
             log_json    TEXT DEFAULT '[]',
+            subject     TEXT DEFAULT '',
+            template_html TEXT DEFAULT '',
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
         CREATE TABLE IF NOT EXISTS open_records (
@@ -99,10 +102,35 @@ def init_db():
             email       TEXT NOT NULL UNIQUE,
             unsubbed_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS password_resets (
+            token       TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            used        INTEGER DEFAULT 0
+        );
         """)
         db.commit()
 
 init_db()
+
+# ── DB Migration — safely add new columns to existing databases ───────────────
+def migrate_db():
+    """Add new columns to existing DB without destroying data."""
+    with app.app_context():
+        db = get_db()
+        migrations = [
+            "ALTER TABLE campaign_records ADD COLUMN subject TEXT DEFAULT ''",
+            "ALTER TABLE campaign_records ADD COLUMN template_html TEXT DEFAULT ''",
+        ]
+        for sql in migrations:
+            try:
+                db.execute(sql)
+                db.commit()
+                log.info(f"Migration applied: {sql[:60]}")
+            except Exception:
+                pass  # Column already exists — safe to ignore
+
+migrate_db()
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
@@ -128,15 +156,17 @@ def save_campaign_to_db(campaign_id, user_id, state):
     db.execute("""
         INSERT OR REPLACE INTO campaign_records
         (id, user_id, status, total, sent, failed, skipped, opens, unsubscribes,
-         created_at, scheduled_for, attachments, log_json)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+         created_at, scheduled_for, attachments, log_json, subject, template_html)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (campaign_id, user_id,
           state.get("status"), state.get("total",0),
           state.get("sent",0), state.get("failed",0), state.get("skipped",0),
           state.get("opens",0), state.get("unsubscribes",0),
           state.get("created_at"), state.get("scheduled_for"),
           json.dumps(state.get("attachments",[])),
-          json.dumps(state.get("log",[])[-100:])))
+          json.dumps(state.get("log",[])[-100:]),
+          state.get("subject",""),
+          state.get("template_html","")))
     db.commit()
 
 def update_campaign_stats(campaign_id, user_id):
@@ -228,7 +258,17 @@ def detect_email(recipient):
     return ""
 
 def render_html(tpl, variables):
-    return Template(tpl).render(**variables)
+    """Render Jinja2 template safely. If template has syntax errors, return as plain HTML."""
+    try:
+        return Template(tpl).render(**variables)
+    except TemplateError:
+        # Template has invalid syntax (e.g. {{ First Name }})
+        # Fall back to simple string replacement so emails still send
+        result = tpl
+        for key, val in variables.items():
+            result = result.replace(f"{{{{{key}}}}}", str(val))
+            result = result.replace(f"{{{{ {key} }}}}", str(val))
+        return result
 
 def strip_tags(html):
     return re.sub(r"<[^>]+>", "", html).strip()
@@ -259,14 +299,42 @@ def wrap_links(html_body, campaign_id, encoded_email, base_url):
 
 def inject_tracking(html_body, campaign_id, email, base_url):
     encoded_email = enc(email)
-    unsub_url = f"{base_url}/track/unsub/{campaign_id}/{encoded_email}"
+    unsub_url    = f"{base_url}/track/unsub/{campaign_id}/{encoded_email}"
+    receipt_url  = f"{base_url}/track/receipt/{campaign_id}/{encoded_email}"
+
     html_body = html_body.replace("{{unsubscribe_link}}", unsub_url)
     html_body = html_body.replace("{{ unsubscribe_link }}", unsub_url)
+
+    # ── Confirm Receipt button (visible, reliable open tracking) ──────────────
+    receipt_block = f"""
+<div style="text-align:center;padding:20px 16px 8px;font-family:Arial,sans-serif">
+  <a href="{receipt_url}" style="display:inline-block;background:#22c55e;color:#ffffff;
+     padding:11px 28px;border-radius:7px;text-decoration:none;font-size:13px;
+     font-weight:600;letter-spacing:0.3px;box-shadow:0 2px 8px rgba(34,197,94,.35)">
+    ✅ Confirm Receipt
+  </a>
+  <div style="font-size:11px;color:#999;margin-top:6px">
+    Click to confirm you received this email
+  </div>
+</div>"""
+
+    # ── Unsubscribe footer ────────────────────────────────────────────────────
     if "unsubscribe" not in html_body.lower():
-        footer = (f'<div style="text-align:center;padding:16px 12px 8px;font-family:Arial,sans-serif">'
-                  f'<a href="{unsub_url}" style="color:#888;font-size:11px;text-decoration:underline">Unsubscribe</a></div>')
-        html_body = re.sub(r"</body>", f"{footer}</body>", html_body, flags=re.IGNORECASE) \
-                    if re.search(r"</body>", html_body, re.IGNORECASE) else html_body + footer
+        unsub_footer = (
+            f'<div style="text-align:center;padding:8px 12px 16px;font-family:Arial,sans-serif">'
+            f'<a href="{unsub_url}" style="color:#aaa;font-size:11px;text-decoration:underline">Unsubscribe</a>'
+            f'</div>')
+    else:
+        unsub_footer = ""
+
+    inject = receipt_block + unsub_footer
+
+    if re.search(r"</body>", html_body, re.IGNORECASE):
+        html_body = re.sub(r"</body>", f"{inject}</body>", html_body, flags=re.IGNORECASE)
+    else:
+        html_body += inject
+
+    # Wrap all links for click tracking
     html_body = wrap_links(html_body, campaign_id, encoded_email, base_url)
     return html_body
 
@@ -277,8 +345,8 @@ def build_mime(sender_email, sender_name, subject, to_email, html_body, attachme
     if attachments:
         msg = MIMEMultipart("mixed")
         alt = MIMEMultipart("alternative")
-        alt.attach(MIMEText(strip_tags(html_body), "plain"))
-        alt.attach(MIMEText(html_body, "html"))
+        alt.attach(MIMEText(strip_tags(html_body), "plain", "utf-8"))
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
         msg.attach(alt)
         for filename, filedata in attachments:
             mime_type, _ = mimetypes.guess_type(filename)
@@ -290,8 +358,8 @@ def build_mime(sender_email, sender_name, subject, to_email, html_body, attachme
             msg.attach(part)
     else:
         msg = MIMEMultipart("alternative")
-        msg.attach(MIMEText(strip_tags(html_body), "plain"))
-        msg.attach(MIMEText(html_body, "html"))
+        msg.attach(MIMEText(strip_tags(html_body), "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
     msg["Subject"] = subject
     msg["From"] = f"{sender_name} <{sender_email}>"
     msg["To"] = to_email
@@ -349,7 +417,7 @@ def run_campaign(campaign_id, user_id, cfg, recipients, template_str,
                                       subject, email, html_body, attachments)
                 if dry_run:
                     preview_dir = Path(f"previews/{campaign_id}"); preview_dir.mkdir(parents=True, exist_ok=True)
-                    (preview_dir / f"{email.replace('@','_at_').replace('.','_')}.html").write_text(html_body)
+                    (preview_dir / f"{email.replace('@','_at_').replace('.','_')}.html").write_text(html_body, encoding='utf-8')
                     state["log"].append({"type":"info","msg":f"✓ Preview saved for {email}"})
                 else:
                     send_smtp(cfg, mime_msg)
@@ -357,7 +425,7 @@ def run_campaign(campaign_id, user_id, cfg, recipients, template_str,
                 state["sent"] += 1
             except TemplateError as e:
                 state["failed"] += 1
-                state["log"].append({"type":"error","msg":f"Template error for {email}: {e}"})
+                state["log"].append({"type":"error","msg":f"Template error for {email}: {e} — check for variables with spaces e.g. use {{{{first_name}}}} not {{{{First Name}}}}"})
             except smtplib.SMTPException as e:
                 state["failed"] += 1
                 state["log"].append({"type":"error","msg":f"SMTP error for {email}: {e}"})
@@ -557,6 +625,9 @@ def preview_template():
     except TemplateError as e:
         return jsonify({"ok":False,"error":str(e)}), 400
 
+# ── Server-side recipient store (keyed by upload_id) ─────────────────────────
+recipient_store: dict[str, list] = {}
+
 @app.route("/api/parse-csv", methods=["POST"])
 @login_required
 def parse_csv_route():
@@ -565,7 +636,18 @@ def parse_csv_route():
     try:
         rows, columns = parse_file(file)
         if not rows: return jsonify({"ok":False,"error":"File appears empty"}), 400
-        return jsonify({"ok":True,"columns":columns,"count":len(rows),"sample":rows[:3],"rows":rows})
+        # Store recipients server-side — only send sample + metadata to client
+        upload_id = str(uuid.uuid4())[:12]
+        recipient_store[upload_id] = rows
+        return jsonify({
+            "ok": True,
+            "upload_id": upload_id,
+            "columns": columns,
+            "count": len(rows),
+            "sample": rows[:3],
+            # Still send full rows for small lists (under 500) for backward compat
+            "rows": rows if len(rows) <= 500 else []
+        })
     except Exception as e:
         return jsonify({"ok":False,"error":f"Could not read file: {e}"}), 400
 
@@ -581,7 +663,6 @@ def launch():
         attachments = []
 
     cfg          = data.get("smtp",{})
-    recipients   = data.get("recipients",[])
     template_str = data.get("template","")
     use_ai       = data.get("use_ai",False)
     dry_run      = data.get("dry_run",True)
@@ -589,7 +670,13 @@ def launch():
     user_id      = session['user_id']
     user_email   = session['user_email']
 
-    if not recipients:   return jsonify({"ok":False,"error":"No recipients"}), 400
+    # Get recipients — prefer server-side store, fall back to inline
+    upload_id  = data.get("upload_id")
+    recipients = recipient_store.get(upload_id, []) if upload_id else []
+    if not recipients:
+        recipients = data.get("recipients", [])
+
+    if not recipients:   return jsonify({"ok":False,"error":"No recipients. Please re-upload your file."}), 400
     if not template_str: return jsonify({"ok":False,"error":"No template"}), 400
 
     # Use account email as sender
@@ -628,6 +715,8 @@ def launch():
         "cancelled":False,"scheduled_for":sched,
         "created_at":datetime.utcnow().isoformat(),
         "attachments":[name for name,_ in attachments],
+        "subject": cfg.get("subject_template",""),
+        "template_html": template_str,
     }
     if attachments:
         state["log"].append({"type":"info","msg":f"📎 {len(attachments)} attachment(s): {', '.join(n for n,_ in attachments)}"})
@@ -723,6 +812,204 @@ def delete_campaign(campaign_id):
     db.commit()
     campaigns.pop(campaign_id,None)
     return jsonify({"ok":True})
+
+
+# ── Confirm Receipt (visible button click tracking) ───────────────────────────
+@app.route("/track/receipt/<campaign_id>/<encoded_email>")
+def track_receipt(campaign_id, encoded_email):
+    """Tracks a confirmed open via button click — most reliable method."""
+    try:
+        with app.app_context():
+            email = dec(encoded_email)
+            record_open_db(campaign_id, email, via="receipt")
+            log.info(f"Receipt confirmed: {email} for campaign {campaign_id}")
+    except Exception as e:
+        log.warning(f"track_receipt: {e}")
+    return """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Receipt Confirmed</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:#0b0f0c;
+     display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:#121712;border:1px solid #2a3a2c;border-radius:16px;
+      padding:48px 40px;text-align:center;max-width:400px;width:90%;
+      box-shadow:0 8px 40px rgba(0,0,0,.4)}
+.icon{font-size:56px;margin-bottom:16px}
+h2{color:#22c55e;font-size:24px;margin-bottom:8px;font-weight:700}
+p{color:#6b8a6e;font-size:14px;line-height:1.6}</style></head>
+<body><div class="card">
+  <div class="icon">✅</div>
+  <h2>Receipt Confirmed!</h2>
+  <p>Thank you for confirming you received this email.<br/>You may now close this tab.</p>
+</div></body></html>"""
+
+
+# ── Password Reset ────────────────────────────────────────────────────────────
+@app.route("/forgot-password")
+def forgot_password_page():
+    return render_template("auth.html", mode="forgot")
+
+@app.route("/reset-password")
+def reset_password_page():
+    token = request.args.get("token","")
+    if not token: return redirect("/login")
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM password_resets WHERE token=? AND used=0",
+        (token,)).fetchone()
+    if not row: return render_template("auth.html", mode="reset_invalid")
+    # Check expiry
+    from datetime import timezone
+    expires = datetime.fromisoformat(row['expires_at'])
+    if datetime.utcnow() > expires:
+        return render_template("auth.html", mode="reset_expired")
+    return render_template("auth.html", mode="reset", token=token)
+
+@app.route("/api/auth/forgot-password", methods=["POST"])
+def forgot_password():
+    d = request.json or {}
+    email = (d.get("email","")).strip().lower()
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if not user:
+        return jsonify({"ok":True, "message":"If that email exists, a reset link has been sent.", "no_user":True})
+
+    from datetime import timedelta
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+    db.execute("INSERT INTO password_resets (token, user_id, expires_at) VALUES (?,?,?)",
+               (token, user['id'], expires))
+    db.commit()
+
+    base_url = request.host_url.rstrip("/")
+    reset_link = f"{base_url}/reset-password?token={token}"
+
+    # Try to send via user's saved SMTP
+    email_sent = False
+    smtp_row = db.execute("SELECT * FROM smtp_settings WHERE user_id=?",
+                          (user['id'],)).fetchone()
+    if smtp_row and smtp_row['smtp_host'] and smtp_row['smtp_pass']:
+        try:
+            html_body = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"/></head>
+<body style="font-family:Arial,sans-serif;background:#f4f4f4;padding:20px;margin:0">
+<div style="max-width:500px;margin:0 auto;background:#fff;border-radius:10px;padding:36px 40px;box-shadow:0 2px 8px rgba(0,0,0,.08)">
+  <div style="text-align:center;margin-bottom:20px">
+    <div style="background:#22c55e;display:inline-block;width:48px;height:48px;border-radius:12px;line-height:48px;font-size:24px;color:#fff">🔑</div>
+  </div>
+  <h2 style="color:#111;margin:0 0 8px;font-size:20px;text-align:center">Reset Your Password</h2>
+  <p style="color:#555;line-height:1.7;margin-bottom:20px;text-align:center">Hi <strong>{user['name']}</strong>, click the button below to reset your LogiMail password. This link expires in <strong>1 hour</strong>.</p>
+  <div style="text-align:center;margin:28px 0">
+    <a href="{reset_link}" style="background:#22c55e;color:#fff;padding:14px 36px;border-radius:8px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block">
+      Reset My Password
+    </a>
+  </div>
+  <p style="color:#999;font-size:12px;text-align:center">If you didn't request this, you can safely ignore this email.</p>
+  <hr style="border:none;border-top:1px solid #eee;margin:20px 0"/>
+  <p style="color:#bbb;font-size:11px;text-align:center">Or copy this link: {reset_link}</p>
+</div></body></html>"""
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = "Reset your LogiMail password"
+            msg["From"] = f"{smtp_row['from_name'] or 'LogiMail'} <{user['email']}>"
+            msg["To"] = user['email']
+            msg.attach(MIMEText(f"Reset your LogiMail password.\n\nClick here: {reset_link}\n\nThis link expires in 1 hour.", "plain", "utf-8"))
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
+            with smtplib.SMTP(smtp_row['smtp_host'], int(smtp_row['smtp_port'] or 587)) as s:
+                s.ehlo(); s.starttls()
+                s.login(user['email'], smtp_row['smtp_pass'])
+                s.sendmail(user['email'], user['email'], msg.as_string())
+            email_sent = True
+            log.info(f"Password reset email sent to {email}")
+        except Exception as e:
+            log.warning(f"Password reset email failed: {e}")
+
+    # Always return the reset link so user can use it even if email fails
+    return jsonify({
+        "ok": True,
+        "email_sent": email_sent,
+        "reset_link": reset_link,
+        "message": "Reset link sent to your email!" if email_sent else "Could not send email — use the link below to reset your password."
+    })
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+def reset_password():
+    d = request.json or {}
+    token = d.get("token","")
+    new_pw = d.get("password","")
+    if len(new_pw) < 6:
+        return jsonify({"ok":False,"error":"Password must be at least 6 characters"}), 400
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM password_resets WHERE token=? AND used=0", (token,)).fetchone()
+    if not row: return jsonify({"ok":False,"error":"Invalid or expired reset link"}), 400
+    expires = datetime.fromisoformat(row['expires_at'])
+    if datetime.utcnow() > expires:
+        return jsonify({"ok":False,"error":"Reset link has expired"}), 400
+    db.execute("UPDATE users SET password=? WHERE id=?",
+               (hash_pw(new_pw), row['user_id']))
+    db.execute("UPDATE password_resets SET used=1 WHERE token=?", (token,))
+    db.commit()
+    return jsonify({"ok":True})
+
+
+# ── Campaign Duplication ──────────────────────────────────────────────────────
+@app.route("/api/campaigns/<campaign_id>/duplicate", methods=["POST"])
+@login_required
+def duplicate_campaign(campaign_id):
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM campaign_records WHERE id=? AND user_id=?",
+        (campaign_id, session['user_id'])).fetchone()
+    if not row: return jsonify({"ok":False,"error":"Campaign not found"}), 404
+    return jsonify({
+        "ok": True,
+        "subject": row['subject'] or "",
+        "template_html": row['template_html'] or "",
+    })
+
+
+# ── Analytics ─────────────────────────────────────────────────────────────────
+@app.route("/api/analytics/<campaign_id>")
+@login_required
+def campaign_analytics(campaign_id):
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM campaign_records WHERE id=? AND user_id=?",
+        (campaign_id, session['user_id'])).fetchone()
+    if not row: return jsonify({"ok":False,"error":"Not found"}), 404
+
+    opens = db.execute(
+        "SELECT COUNT(DISTINCT email) FROM open_records WHERE campaign_id=?",
+        (campaign_id,)).fetchone()[0]
+    unsubs = db.execute(
+        "SELECT COUNT(*) FROM unsub_records WHERE campaign_id=?",
+        (campaign_id,)).fetchone()[0]
+
+    # Opens over time (hourly buckets)
+    open_events = db.execute(
+        "SELECT opened_at FROM open_records WHERE campaign_id=? ORDER BY opened_at",
+        (campaign_id,)).fetchall()
+    open_via = db.execute(
+        "SELECT via, COUNT(*) as cnt FROM open_records WHERE campaign_id=? GROUP BY via",
+        (campaign_id,)).fetchall()
+
+    live = campaigns.get(campaign_id, {})
+    sent    = live.get("sent",    row['sent'])
+    failed  = live.get("failed",  row['failed'])
+    skipped = live.get("skipped", row['skipped'])
+    total   = live.get("total",   row['total'])
+
+    return jsonify({
+        "ok": True,
+        "id": campaign_id,
+        "status": live.get("status", row['status']),
+        "total": total, "sent": sent, "failed": failed,
+        "skipped": skipped, "opens": opens, "unsubscribes": unsubs,
+        "open_rate": round(opens/sent*100, 1) if sent > 0 else 0,
+        "open_events": [e['opened_at'] for e in open_events],
+        "open_via": {r['via']: r['cnt'] for r in open_via},
+        "created_at": row['created_at'],
+    })
+
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

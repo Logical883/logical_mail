@@ -83,9 +83,21 @@ h1{font-family:'Plus Jakarta Sans',sans-serif;font-size:22px;font-weight:800;
   {% if mode == 'login' %}
   <h1>Welcome back</h1>
   <p class="sub">Sign in to your LogiMail dashboard.<br/><span>Send smarter, track everything.</span></p>
-  {% else %}
+  {% elif mode == 'register' %}
   <h1>Create your account</h1>
   <p class="sub">Join LogiMail and start sending personalized bulk emails with <span>AI-powered tracking</span>.</p>
+  {% elif mode == 'forgot' %}
+  <h1>Reset password</h1>
+  <p class="sub">Enter your email and we'll send you a reset link.</p>
+  {% elif mode == 'reset' %}
+  <h1>New password</h1>
+  <p class="sub">Enter your new password below.</p>
+  {% elif mode == 'reset_invalid' %}
+  <h1>Invalid link</h1>
+  <p class="sub" style="color:var(--error)">This reset link is invalid or has already been used. <a href="/forgot-password">Request a new one</a>.</p>
+  {% elif mode == 'reset_expired' %}
+  <h1>Link expired</h1>
+  <p class="sub" style="color:var(--error)">This reset link has expired. <a href="/forgot-password">Request a new one</a>.</p>
   {% endif %}
 
   <div class="err" id="err-msg"></div>
@@ -98,11 +110,14 @@ h1{font-family:'Plus Jakarta Sans',sans-serif;font-size:22px;font-weight:800;
   </div>
   {% endif %}
 
+  {% if mode in ['login', 'register', 'forgot'] %}
   <div class="fgroup">
     <label class="flabel">Email address</label>
-    <input class="finput" id="email" type="email" placeholder="logical@gmail.com" autocomplete="email"/>
+    <input class="finput" id="email" type="email" placeholder="jane@gmail.com" autocomplete="email"/>
   </div>
+  {% endif %}
 
+  {% if mode in ['login', 'register', 'reset'] %}
   <div class="fgroup">
     <label class="flabel">Password{% if mode == 'register' %} (min. 6 characters){% endif %}</label>
     <div class="pw-wrap">
@@ -110,16 +125,29 @@ h1{font-family:'Plus Jakarta Sans',sans-serif;font-size:22px;font-weight:800;
       <button class="pw-toggle" type="button" onclick="togglePw()" id="pw-eye">👁</button>
     </div>
   </div>
+  {% if mode == 'reset' %}
+  <input type="hidden" id="reset-token" value="{{ token }}"/>
+  {% endif %}
+  {% endif %}
 
+  {% if mode not in ['reset_invalid', 'reset_expired'] %}
   <button class="btn btn-primary" id="submit-btn" onclick="submit()">
-    {% if mode == 'login' %}Sign In{% else %}Create Account{% endif %}
+    {% if mode == 'login' %}Sign In
+    {% elif mode == 'register' %}Create Account
+    {% elif mode == 'forgot' %}Send Reset Link
+    {% elif mode == 'reset' %}Set New Password
+    {% endif %}
   </button>
+  {% endif %}
 
   <div class="switch">
     {% if mode == 'login' %}
-    Don't have an account? <a href="/register">Create one</a>
-    {% else %}
+    Don't have an account? <a href="/register">Create one</a><br/><br/>
+    <a href="/forgot-password" style="font-size:12px;color:var(--text3)">Forgot your password?</a>
+    {% elif mode == 'register' %}
     Already have an account? <a href="/login">Sign in</a>
+    {% elif mode in ['forgot', 'reset', 'reset_invalid', 'reset_expired'] %}
+    <a href="/login">← Back to Sign In</a>
     {% endif %}
   </div>
 </div>
@@ -142,10 +170,9 @@ function toggleTheme(){
 
 function togglePw(){
   const inp=document.getElementById('password');
-  inp.type=inp.type==='password'?'text':'password';
+  if(inp) inp.type=inp.type==='password'?'text':'password';
 }
-
-function showErr(msg){ 
+function showErr(msg){
   const el=document.getElementById('err-msg');
   el.textContent=msg; el.style.display='block';
   document.getElementById('ok-msg').style.display='none';
@@ -156,39 +183,79 @@ function showOk(msg){
   document.getElementById('err-msg').style.display='none';
 }
 
-// Submit on Enter
 document.addEventListener('keydown',e=>{ if(e.key==='Enter') submit(); });
 
 async function submit(){
   const btn=document.getElementById('submit-btn');
-  const email=document.getElementById('email').value.trim();
-  const password=document.getElementById('password').value;
+  if(!btn) return;
 
-  if(!email||!password){ showErr('Please fill in all fields'); return; }
-
-  btn.disabled=true;
-  btn.textContent=MODE==='login'?'Signing in…':'Creating account…';
-
-  try{
-    const body={email,password};
-    if(MODE==='register'){
-      const name=document.getElementById('name').value.trim();
-      if(!name){ showErr('Please enter your name'); btn.disabled=false; btn.textContent='Create Account'; return; }
-      body.name=name;
-    }
-    const res=await fetch(`/api/auth/${MODE==='login'?'login':'register'}`,{
-      method:'POST',
+  if(MODE==='login'){
+    const email=document.getElementById('email').value.trim();
+    const password=document.getElementById('password').value;
+    if(!email||!password){showErr('Please fill in all fields');return;}
+    btn.disabled=true; btn.textContent='Signing in…';
+    const res=await fetch('/api/auth/login',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body)
-    });
+      body:JSON.stringify({email,password})});
     const d=await res.json();
-    if(!d.ok){ showErr(d.error||'Something went wrong'); btn.disabled=false; btn.textContent=MODE==='login'?'Sign In':'Create Account'; return; }
-    showOk(MODE==='login'?`Welcome back, ${d.name}!`:`Account created! Welcome, ${d.name}!`);
-    setTimeout(()=>window.location.href='/',800);
-  }catch(e){
-    showErr('Connection error. Please try again.');
-    btn.disabled=false;
-    btn.textContent=MODE==='login'?'Sign In':'Create Account';
+    if(!d.ok){showErr(d.error||'Invalid credentials');btn.disabled=false;btn.textContent='Sign In';return;}
+    showOk(`Welcome back, ${d.name}!`);
+    setTimeout(()=>window.location.href='/',600);
+
+  } else if(MODE==='register'){
+    const name=document.getElementById('name').value.trim();
+    const email=document.getElementById('email').value.trim();
+    const password=document.getElementById('password').value;
+    if(!name||!email||!password){showErr('Please fill in all fields');return;}
+    btn.disabled=true; btn.textContent='Creating account…';
+    const res=await fetch('/api/auth/register',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name,email,password})});
+    const d=await res.json();
+    if(!d.ok){showErr(d.error||'Something went wrong');btn.disabled=false;btn.textContent='Create Account';return;}
+    showOk(`Account created! Welcome, ${d.name}!`);
+    setTimeout(()=>window.location.href='/',600);
+
+  } else if(MODE==='forgot'){
+    const email=document.getElementById('email').value.trim();
+    if(!email){showErr('Please enter your email');return;}
+    btn.disabled=true; btn.textContent='Sending…';
+    const res=await fetch('/api/auth/forgot-password',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email})});
+    const d=await res.json();
+    if(d.no_user){
+      showOk('If that email exists, a reset link has been sent.');
+    } else if(d.email_sent){
+      showOk('✅ Reset link sent! Check your email inbox.');
+    } else {
+      // Email failed — show the link directly so user isn't stuck
+      showOk('Email could not be sent automatically. Use this link to reset your password:');
+      if(d.reset_link){
+        const linkEl=document.createElement('div');
+        linkEl.style.cssText='margin-top:10px;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;word-break:break-all;font-size:12px;font-family:monospace';
+        const a=document.createElement('a');
+        a.href=d.reset_link; a.textContent=d.reset_link;
+        a.style.color='var(--accent)';
+        linkEl.appendChild(a);
+        document.getElementById('ok-msg').appendChild(linkEl);
+      }
+    }
+    btn.disabled=false; btn.textContent='Send Reset Link';
+
+  } else if(MODE==='reset'){
+    const password=document.getElementById('password').value;
+    const token=document.getElementById('reset-token').value;
+    if(!password){showErr('Please enter a new password');return;}
+    if(password.length<6){showErr('Password must be at least 6 characters');return;}
+    btn.disabled=true; btn.textContent='Saving…';
+    const res=await fetch('/api/auth/reset-password',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token,password})});
+    const d=await res.json();
+    if(!d.ok){showErr(d.error||'Something went wrong');btn.disabled=false;btn.textContent='Set New Password';return;}
+    showOk('Password updated! Redirecting to login…');
+    setTimeout(()=>window.location.href='/login',1500);
   }
 }
 </script>

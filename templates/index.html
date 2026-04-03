@@ -8,6 +8,7 @@
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg"/>
 <link rel="apple-touch-icon" href="/static/favicon.ico"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
 /* ════════════════════════════════════════
    DESIGN TOKENS
@@ -575,6 +576,37 @@ tr:hover td { background:var(--surface2) }
 .hmet-fail  .hmet-val { color:var(--error) }
 .hmet-unsub .hmet-val { color:var(--warn) }
 .hmet-total .hmet-val { color:var(--text) }
+
+/* ── Template cards ── */
+.tpl-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:16px}
+.tpl-card{border:1px solid var(--border);border-radius:var(--r);overflow:hidden;
+          cursor:pointer;transition:all .15s}
+.tpl-card:hover{border-color:var(--accent);transform:translateY(-2px);
+                box-shadow:0 4px 16px rgba(34,197,94,.15)}
+.tpl-preview{height:130px;overflow:hidden;pointer-events:none;
+             background:#f9f9f9;display:flex;align-items:center;justify-content:center;
+             font-size:11px;color:#666;font-family:Arial,sans-serif}
+.tpl-info{padding:10px 12px;border-top:1px solid var(--border)}
+.tpl-name{font-size:12px;font-weight:600;color:var(--text)}
+.tpl-desc{font-size:11px;color:var(--text3);margin-top:2px}
+
+/* ── Analytics ── */
+.an-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:16px 16px 0}
+.an-card{background:var(--surface2);border:1px solid var(--border);
+         border-radius:var(--r);padding:14px;text-align:center}
+.an-num{font-family:'Plus Jakarta Sans',sans-serif;font-size:26px;
+        font-weight:800;line-height:1}
+.an-lbl{font-size:10px;color:var(--text3);text-transform:uppercase;
+        letter-spacing:1px;margin-top:4px}
+.chart-area{padding:16px;height:220px;position:relative}
+
+@media(max-width:600px){
+  .tpl-grid{grid-template-columns:1fr 1fr}
+  .an-grid{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:400px){
+  .tpl-grid{grid-template-columns:1fr}
+}
 </style>
 </head>
 <body>
@@ -710,6 +742,13 @@ tr:hover td { background:var(--surface2) }
   </div>
 
   <div class="composer">
+    <!-- Composer top bar -->
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border);background:var(--surface2);display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:12px;font-weight:600;color:var(--text3);letter-spacing:.5px">EMAIL COMPOSER</span>
+      <button class="btn btn-outline" style="font-size:11px;padding:5px 12px" onclick="openTemplates()">
+        🎨 Use a Template
+      </button>
+    </div>
     <!-- Subject -->
     <div class="cfield">
       <span class="cfield-lbl">Subject</span>
@@ -754,6 +793,7 @@ tr:hover td { background:var(--surface2) }
       <div class="tb-sep"></div>
       <button class="tb" title="Remove formatting" onclick="cmd('removeFormat')" style="font-size:11px">✕fmt</button>
       <div class="tb-sep"></div>
+      <button class="tb" title="Insert image" onclick="insertImage()" style="font-size:15px">🖼</button>
       <button class="tb" title="Attach file" onclick="document.getElementById('attach-input').click()" style="font-size:16px">📎</button>
       <input id="attach-input" type="file" multiple style="display:none" onchange="addAttachments(this.files)"/>
     </div>
@@ -988,6 +1028,42 @@ tr:hover td { background:var(--surface2) }
 </div>
 </div><!-- /.shell -->
 
+<!-- ════════════════════════════════════════
+     TEMPLATES MODAL
+════════════════════════════════════════ -->
+<div class="modal-overlay" id="tpl-modal" onclick="if(event.target===this)closeTplModal()">
+  <div class="modal" style="max-width:780px">
+    <div class="modal-head">
+      <div class="modal-title">🎨 Professional Email Templates</div>
+      <button class="modal-close" onclick="closeTplModal()">✕</button>
+    </div>
+    <div class="modal-body" style="overflow-y:auto;max-height:520px">
+      <div class="tpl-grid" id="tpl-grid"></div>
+    </div>
+    <div class="modal-foot">
+      <span style="font-size:12px;color:var(--text3)">Click a template to load it into the composer</span>
+      <button class="btn btn-ghost" onclick="closeTplModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════
+     ANALYTICS MODAL
+════════════════════════════════════════ -->
+<div class="modal-overlay" id="analytics-modal" onclick="if(event.target===this)closeAnalytics()">
+  <div class="modal" style="max-width:680px">
+    <div class="modal-head">
+      <div class="modal-title">📊 Campaign Analytics</div>
+      <button class="modal-close" onclick="closeAnalytics()">✕</button>
+    </div>
+    <div class="modal-body" style="overflow-y:auto;max-height:560px">
+      <div id="analytics-content">
+        <div style="text-align:center;padding:40px;color:var(--text3)">Loading…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 {% raw %}
 // ══════════════════════════════════════════
@@ -1079,6 +1155,8 @@ dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag');ha
 // ══════════════════════════════════════════
 // FILE UPLOAD
 // ══════════════════════════════════════════
+let uploadId = SS.load('uploadId', null); // server-side recipient store ID
+
 async function handleFile(file){
   if(!file) return;
   const form=new FormData(); form.append('file',file);
@@ -1086,11 +1164,20 @@ async function handleFile(file){
     const res=await fetch('/api/parse-csv',{method:'POST',body:form});
     const d=await res.json();
     if(!d.ok){toast('Error: '+d.error,'bad');return;}
-    rows=d.rows; cols=d.columns;
-    SS.save('rows',rows); SS.save('cols',cols);
+
+    // Store upload_id for server-side recipient lookup on launch
+    uploadId = d.upload_id;
+    SS.save('uploadId', uploadId);
+
+    // For small lists server still returns rows; for large lists use empty array
+    rows = d.rows && d.rows.length ? d.rows : [];
+    cols = d.columns;
+    SS.save('rows', rows);
+    SS.save('cols', cols);
+    SS.save('recipientCount', d.count);
     SS.save('fname',`${file.name} · ${d.count} rows`);
     SS.save('sample',d.sample);
-    renderFilePreview(d.columns,d.count,`${file.name} · ${d.count} rows`,d.sample);
+    renderFilePreview(d.columns, d.count, `${file.name} · ${d.count} rows`, d.sample);
     toast(`✓ ${d.count} recipients loaded`,'ok');
   }catch(e){toast('Failed to read file','bad')}
 }
@@ -1134,8 +1221,31 @@ function insertVar(name){
   saveEditorState();
 }
 function doLink(){
-  const url=prompt('Enter URL:','https://');
-  if(url) cmd('createLink',url);
+  const sel=window.getSelection();
+  const selectedText=sel&&sel.rangeCount?sel.toString():'';
+  const url=prompt('Enter the URL this button/text should link to:','https://');
+  if(!url||url==='https://') return;
+  if(selectedText){
+    // Wrap selected text in a link
+    cmd('createLink', url);
+  } else {
+    // Insert a styled CTA button
+    const label=prompt('Button label:','Click Here →') || 'Click Here →';
+    const btn=`<a href="${url}" style="display:inline-block;background:#22c55e;color:#fff;padding:12px 28px;border-radius:7px;text-decoration:none;font-weight:600;font-size:14px;margin:8px 0">${label}</a>`;
+    document.getElementById('editor').focus();
+    document.execCommand('insertHTML', false, btn);
+  }
+  saveEditorState();
+}
+
+function insertImage(){
+  const src=prompt('Enter image URL (https://...):\n\nTip: Upload your image to imgur.com or any image host and paste the link here.','https://');
+  if(!src||src==='https://') return;
+  const alt=prompt('Alt text (description of image):','') || '';
+  const imgHTML=`<img src="${src}" alt="${alt}" style="max-width:100%;height:auto;border-radius:6px;margin:8px 0;display:block"/>`;
+  document.getElementById('editor').focus();
+  document.execCommand('insertHTML', false, imgHTML);
+  saveEditorState();
 }
 function getHTML(){
   const body=document.getElementById('editor').innerHTML;
@@ -1290,9 +1400,12 @@ async function launch(){
       subject_template:document.getElementById('subject').value,
       delay_seconds:parseFloat(document.getElementById('delay').value),
     },
-    recipients:rows, template:getHTML(),
+    upload_id: uploadId,           // server looks up recipients by this ID
+    recipients: rows,              // fallback for small lists already in memory
+    template:getHTML(),
     use_ai:document.getElementById('use-ai').checked,
-    dry_run:dry, scheduled_at,
+    dry_run:dry,
+    scheduled_at,
   };
   const btn=document.getElementById('launch-btn');
   btn.disabled=true; btn.textContent='Launching…';
@@ -1387,9 +1500,10 @@ async function stop(){
 
 function newCampaign(){
   clearInterval(timer);
-  campaignId=null; rows=[]; cols=[]; attachedFiles=[];
+  campaignId=null; rows=[]; cols=[]; attachedFiles=[]; uploadId=null;
   SS.clear('campaignId'); SS.clear('rows'); SS.clear('cols');
-  SS.clear('editorHTML'); SS.clear('subject'); SS.clear('fname'); SS.clear('sample');
+  SS.clear('editorHTML'); SS.clear('subject'); SS.clear('fname');
+  SS.clear('sample'); SS.clear('uploadId'); SS.clear('recipientCount');
   renderAttachments();
   document.getElementById('file-preview').style.display='none';
   document.getElementById('btn1').disabled=true;
@@ -1441,8 +1555,10 @@ async function loadHistory(){
         </div>
         <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end">
           ${c.status==='running'||c.status==='scheduled'?
-            `<button class="btn btn-outline" style="font-size:11px;padding:6px 12px" onclick="resumeMonitor('${c.id}')">Monitor →</button>`
+            `<button class="btn btn-outline" style="font-size:11px;padding:6px 12px" onclick="resumeMonitor('${c.id}')">📡 Monitor</button>`
             :''}
+          <button class="btn btn-outline" style="font-size:11px;padding:6px 12px" onclick="openAnalytics('${c.id}')">📊 Analytics</button>
+          <button class="btn btn-outline" style="font-size:11px;padding:6px 12px" onclick="duplicateCampaign('${c.id}')">📋 Duplicate</button>
           <button class="btn btn-danger" style="font-size:11px;padding:6px 12px" onclick="deleteCampaign('${c.id}',this)">🗑 Delete</button>
         </div>
       </div>`;
@@ -1529,7 +1645,13 @@ window.addEventListener('DOMContentLoaded',async ()=>{
   // File data
   const sr=SS.load('rows',[]),sc=SS.load('cols',[]);
   const sfn=SS.load('fname',''),ss=SS.load('sample',[]);
+  uploadId = SS.load('uploadId', null);
   if(sr.length&&sc.length){rows=sr;cols=sc;renderFilePreview(sc,sr.length,sfn,ss);}
+  else if(uploadId){
+    // Large list — restore preview from saved metadata
+    const savedCount=SS.load('recipientCount',0);
+    if(sc.length&&savedCount) renderFilePreview(sc,savedCount,sfn,ss);
+  }
 
   // Editor
   const eh=SS.load('editorHTML',''),es=SS.load('subject','');
@@ -1553,6 +1675,339 @@ window.addEventListener('DOMContentLoaded',async ()=>{
 
   goTo(SS.load('page',0));
 });
+// ══════════════════════════════════════════
+// EMAIL TEMPLATES
+// ══════════════════════════════════════════
+const EMAIL_TEMPLATES = [
+  {
+    name: "Professional Newsletter",
+    desc: "Clean newsletter layout with header and CTA",
+    color: "#1e40af",
+    subject: "{{first_name}}, here's your update from us",
+    body: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+  <div style="background:#1e40af;padding:32px 36px;text-align:center;border-radius:10px 10px 0 0">
+    <h1 style="color:#fff;margin:0;font-size:24px;font-weight:700">Monthly Newsletter</h1>
+    <p style="color:#bfdbfe;margin:8px 0 0;font-size:14px">Keeping you informed</p>
+  </div>
+  <div style="background:#fff;padding:32px 36px;border:1px solid #e5e7eb">
+    <p style="color:#111;font-size:15px;line-height:1.7">Hi {{first_name}},</p>
+    <p style="color:#374151;font-size:15px;line-height:1.7">We have some exciting updates to share with you this month. Here's what's been happening at <strong>{{company}}</strong>.</p>
+    <h2 style="color:#1e40af;font-size:18px;margin:24px 0 12px">What's New</h2>
+    <p style="color:#374151;font-size:14px;line-height:1.7">Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>
+    <div style="text-align:center;margin:28px 0">
+      <a href="{{cta_link}}" style="background:#1e40af;color:#fff;padding:13px 32px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px">Read More →</a>
+    </div>
+  </div>
+  <div style="background:#f9fafb;padding:16px 36px;text-align:center;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 10px 10px">
+    <p style="color:#9ca3af;font-size:11px;margin:0">You're receiving this because you subscribed to our newsletter.</p>
+  </div>
+</div>`
+  },
+  {
+    name: "Sales Promotion",
+    desc: "Bold promo email with offer and urgency",
+    color: "#dc2626",
+    subject: "🔥 Exclusive offer just for you, {{first_name}}",
+    body: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+  <div style="background:linear-gradient(135deg,#dc2626,#b91c1c);padding:36px;text-align:center;border-radius:10px 10px 0 0">
+    <div style="background:rgba(255,255,255,.15);display:inline-block;padding:6px 16px;border-radius:20px;margin-bottom:12px">
+      <span style="color:#fef2f2;font-size:12px;font-weight:600;letter-spacing:1px">LIMITED TIME OFFER</span>
+    </div>
+    <h1 style="color:#fff;margin:0;font-size:32px;font-weight:800">50% OFF</h1>
+    <p style="color:#fca5a5;margin:8px 0 0;font-size:15px">Exclusively for you, {{first_name}}</p>
+  </div>
+  <div style="background:#fff;padding:32px 36px;border:1px solid #e5e7eb">
+    <p style="color:#111;font-size:15px;line-height:1.7">Hi {{first_name}},</p>
+    <p style="color:#374151;font-size:15px;line-height:1.7">As a valued customer at <strong>{{company}}</strong>, we're giving you an exclusive discount. This offer expires in <strong>48 hours</strong>.</p>
+    <div style="background:#fef2f2;border:2px dashed #dc2626;border-radius:8px;padding:16px;text-align:center;margin:20px 0">
+      <p style="color:#dc2626;font-size:13px;margin:0 0 6px;font-weight:600">USE CODE:</p>
+      <p style="color:#111;font-size:24px;font-weight:800;margin:0;letter-spacing:3px">SAVE50</p>
+    </div>
+    <div style="text-align:center;margin:24px 0">
+      <a href="{{cta_link}}" style="background:#dc2626;color:#fff;padding:14px 36px;border-radius:6px;text-decoration:none;font-weight:700;font-size:15px">Claim My Discount →</a>
+    </div>
+    <p style="color:#9ca3af;font-size:12px;text-align:center">Offer valid for 48 hours only. Cannot be combined with other offers.</p>
+  </div>
+</div>`
+  },
+  {
+    name: "Welcome Email",
+    desc: "Warm onboarding email for new users",
+    color: "#22c55e",
+    subject: "Welcome to the family, {{first_name}}! 🎉",
+    body: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+  <div style="background:#22c55e;padding:36px;text-align:center;border-radius:10px 10px 0 0">
+    <div style="font-size:48px;margin-bottom:12px">🎉</div>
+    <h1 style="color:#fff;margin:0;font-size:26px;font-weight:700">Welcome, {{first_name}}!</h1>
+    <p style="color:#bbf7d0;margin:8px 0 0;font-size:14px">We're thrilled to have you on board</p>
+  </div>
+  <div style="background:#fff;padding:32px 36px;border:1px solid #e5e7eb">
+    <p style="color:#111;font-size:15px;line-height:1.7">Hi {{first_name}},</p>
+    <p style="color:#374151;font-size:15px;line-height:1.7">Welcome to <strong>{{company}}</strong>! Your account is all set up and ready to go. Here's how to get started:</p>
+    <div style="margin:20px 0">
+      <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:16px;padding:14px;background:#f0fdf4;border-radius:8px">
+        <span style="font-size:20px">1️⃣</span>
+        <div><strong style="color:#15803d">Complete your profile</strong><br/><span style="color:#374151;font-size:13px">Add your details to get personalized recommendations</span></div>
+      </div>
+      <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:16px;padding:14px;background:#f0fdf4;border-radius:8px">
+        <span style="font-size:20px">2️⃣</span>
+        <div><strong style="color:#15803d">Explore the dashboard</strong><br/><span style="color:#374151;font-size:13px">See everything available to you as a member</span></div>
+      </div>
+      <div style="display:flex;gap:12px;align-items:flex-start;padding:14px;background:#f0fdf4;border-radius:8px">
+        <span style="font-size:20px">3️⃣</span>
+        <div><strong style="color:#15803d">Get in touch</strong><br/><span style="color:#374151;font-size:13px">Our team is here to help anytime</span></div>
+      </div>
+    </div>
+    <div style="text-align:center;margin:24px 0">
+      <a href="{{cta_link}}" style="background:#22c55e;color:#fff;padding:13px 32px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px">Get Started →</a>
+    </div>
+  </div>
+</div>`
+  },
+  {
+    name: "Product Announcement",
+    desc: "Feature launch or product update email",
+    color: "#7c3aed",
+    subject: "{{first_name}}, something new is here 🚀",
+    body: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+  <div style="background:linear-gradient(135deg,#7c3aed,#4f46e5);padding:36px;text-align:center;border-radius:10px 10px 0 0">
+    <div style="font-size:44px;margin-bottom:12px">🚀</div>
+    <h1 style="color:#fff;margin:0;font-size:26px;font-weight:700">Introducing Something New</h1>
+    <p style="color:#c4b5fd;margin:8px 0 0;font-size:14px">We've been working on this just for you</p>
+  </div>
+  <div style="background:#fff;padding:32px 36px;border:1px solid #e5e7eb">
+    <p style="color:#111;font-size:15px;line-height:1.7">Hi {{first_name}},</p>
+    <p style="color:#374151;font-size:15px;line-height:1.7">We're excited to announce our latest update at <strong>{{company}}</strong>. This has been one of our most requested features and we think you're going to love it.</p>
+    <div style="background:#f5f3ff;border-left:4px solid #7c3aed;padding:16px 20px;border-radius:0 8px 8px 0;margin:20px 0">
+      <p style="color:#374151;font-size:14px;line-height:1.7;margin:0"><strong style="color:#7c3aed">✨ What's new:</strong><br/>A brand new feature that helps you work smarter, save time, and get better results — all from one place.</p>
+    </div>
+    <div style="text-align:center;margin:24px 0">
+      <a href="{{cta_link}}" style="background:#7c3aed;color:#fff;padding:13px 32px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px">See What's New →</a>
+    </div>
+  </div>
+</div>`
+  },
+  {
+    name: "Follow-Up",
+    desc: "Professional follow-up after a meeting or event",
+    color: "#0891b2",
+    subject: "Following up, {{first_name}} — quick note",
+    body: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+  <div style="background:#fff;padding:36px;border:1px solid #e5e7eb;border-radius:10px">
+    <p style="color:#111;font-size:15px;line-height:1.7;margin:0 0 16px">Hi {{first_name}},</p>
+    <p style="color:#374151;font-size:15px;line-height:1.7">I wanted to follow up from our recent conversation. As we discussed, I think there's a great opportunity for us to work together at <strong>{{company}}</strong>.</p>
+    <p style="color:#374151;font-size:15px;line-height:1.7">Here's a quick summary of what we covered:</p>
+    <ul style="color:#374151;font-size:14px;line-height:1.9;padding-left:20px;margin:16px 0">
+      <li>Key point from your discussion</li>
+      <li>Next steps we agreed on</li>
+      <li>Timeline and expectations</li>
+    </ul>
+    <p style="color:#374151;font-size:15px;line-height:1.7">I'd love to schedule a call to move things forward. Please click the button below to find a time that works for you.</p>
+    <div style="text-align:center;margin:28px 0">
+      <a href="{{cta_link}}" style="background:#0891b2;color:#fff;padding:13px 32px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px">Schedule a Call →</a>
+    </div>
+    <p style="color:#374151;font-size:14px;line-height:1.7">Looking forward to hearing from you.</p>
+    <p style="color:#111;font-size:14px;margin:16px 0 0">Best regards,<br/><strong>{{sender_name}}</strong></p>
+  </div>
+</div>`
+  },
+  {
+    name: "Event Invitation",
+    desc: "Invite recipients to an event or webinar",
+    color: "#d97706",
+    subject: "You're invited, {{first_name}}! 📅",
+    body: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+  <div style="background:linear-gradient(135deg,#d97706,#b45309);padding:36px;text-align:center;border-radius:10px 10px 0 0">
+    <div style="font-size:44px;margin-bottom:12px">📅</div>
+    <h1 style="color:#fff;margin:0;font-size:26px;font-weight:700">You're Invited!</h1>
+    <p style="color:#fde68a;margin:8px 0 0;font-size:14px">A special event just for you</p>
+  </div>
+  <div style="background:#fff;padding:32px 36px;border:1px solid #e5e7eb">
+    <p style="color:#111;font-size:15px;line-height:1.7">Dear {{first_name}},</p>
+    <p style="color:#374151;font-size:15px;line-height:1.7">We're delighted to invite you to our upcoming event. Join us for an evening of insights, networking, and exciting announcements from <strong>{{company}}</strong>.</p>
+    <div style="background:#fffbeb;border:1px solid #fcd34d;border-radius:10px;padding:20px;margin:20px 0">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+        <span style="font-size:18px">📆</span><strong style="color:#92400e">Date & Time</strong>
+      </div>
+      <p style="color:#374151;margin:0;font-size:14px">Saturday, [Date] at [Time]</p>
+      <div style="display:flex;align-items:center;gap:10px;margin:14px 0 10px">
+        <span style="font-size:18px">📍</span><strong style="color:#92400e">Location</strong>
+      </div>
+      <p style="color:#374151;margin:0;font-size:14px">[Venue Name], [City]</p>
+    </div>
+    <div style="text-align:center;margin:24px 0">
+      <a href="{{cta_link}}" style="background:#d97706;color:#fff;padding:13px 32px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px">RSVP Now →</a>
+    </div>
+    <p style="color:#9ca3af;font-size:12px;text-align:center">Seats are limited. Reserve yours today.</p>
+  </div>
+</div>`
+  },
+];
+
+let activeChartInstance = null;
+
+function openTemplates(){
+  const grid = document.getElementById('tpl-grid');
+  grid.innerHTML = EMAIL_TEMPLATES.map((t,i) => `
+    <div class="tpl-card" onclick="applyTemplate(${i})">
+      <div class="tpl-preview" style="background:${t.color}10;border-bottom:3px solid ${t.color}">
+        <div style="padding:12px;width:100%">
+          <div style="background:${t.color};height:24px;border-radius:4px;margin-bottom:8px;opacity:.9"></div>
+          <div style="background:#e5e7eb;height:8px;border-radius:3px;margin-bottom:5px;width:90%"></div>
+          <div style="background:#e5e7eb;height:8px;border-radius:3px;margin-bottom:5px;width:75%"></div>
+          <div style="background:#e5e7eb;height:8px;border-radius:3px;margin-bottom:12px;width:85%"></div>
+          <div style="background:${t.color};height:28px;border-radius:5px;width:60%;margin:0 auto;opacity:.85"></div>
+        </div>
+      </div>
+      <div class="tpl-info">
+        <div class="tpl-name">${t.name}</div>
+        <div class="tpl-desc">${t.desc}</div>
+      </div>
+    </div>`).join('');
+  document.getElementById('tpl-modal').classList.add('on');
+}
+
+function closeTplModal(){
+  document.getElementById('tpl-modal').classList.remove('on');
+}
+
+function applyTemplate(idx){
+  const t = EMAIL_TEMPLATES[idx];
+  document.getElementById('editor').innerHTML = t.body;
+  document.getElementById('subject').value = t.subject;
+  saveEditorState();
+  closeTplModal();
+  toast(`✓ "${t.name}" template loaded`,'ok');
+}
+
+// ══════════════════════════════════════════
+// ANALYTICS
+// ══════════════════════════════════════════
+async function openAnalytics(campaignId){
+  document.getElementById('analytics-modal').classList.add('on');
+  document.getElementById('analytics-content').innerHTML =
+    '<div style="text-align:center;padding:40px;color:var(--text3)">⏳ Loading analytics…</div>';
+
+  if(activeChartInstance){ activeChartInstance.destroy(); activeChartInstance=null; }
+
+  try{
+    const res = await fetch(`/api/analytics/${campaignId}`);
+    const d   = await res.json();
+    if(!d.ok){ document.getElementById('analytics-content').innerHTML='<div style="padding:20px;color:var(--error)">Failed to load analytics.</div>'; return; }
+
+    const openRate = d.open_rate || 0;
+    const viaMap   = d.open_via || {};
+
+    document.getElementById('analytics-content').innerHTML = `
+      <div class="an-grid">
+        <div class="an-card"><div class="an-num" style="color:var(--text)">${d.total}</div><div class="an-lbl">Total</div></div>
+        <div class="an-card"><div class="an-num" style="color:var(--success)">${d.sent}</div><div class="an-lbl">Sent</div></div>
+        <div class="an-card"><div class="an-num" style="color:var(--accent)">${d.opens}</div><div class="an-lbl">Opened</div></div>
+        <div class="an-card"><div class="an-num" style="color:var(--accent)">${openRate}%</div><div class="an-lbl">Open Rate</div></div>
+        <div class="an-card"><div class="an-num" style="color:var(--warn)">${d.unsubscribes}</div><div class="an-lbl">Unsubs</div></div>
+        <div class="an-card"><div class="an-num" style="color:var(--error)">${d.failed}</div><div class="an-lbl">Failed</div></div>
+      </div>
+
+      <div style="padding:16px;display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <!-- Donut chart: sent/failed/skipped -->
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:14px">
+          <div style="font-size:11px;font-weight:700;color:var(--text3);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:12px">Delivery Breakdown</div>
+          <div style="position:relative;height:160px"><canvas id="donut-chart"></canvas></div>
+        </div>
+        <!-- Bar chart: opens by method -->
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:14px">
+          <div style="font-size:11px;font-weight:700;color:var(--text3);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:12px">Opens by Method</div>
+          <div style="position:relative;height:160px"><canvas id="bar-chart"></canvas></div>
+        </div>
+      </div>
+
+      <div style="padding:0 16px 16px">
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:14px">
+          <div style="font-size:11px;font-weight:700;color:var(--text3);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:6px">Campaign Details</div>
+          <div style="display:flex;gap:20px;flex-wrap:wrap;font-size:12px;color:var(--text2)">
+            <span>📅 Created: <strong>${new Date(d.created_at).toLocaleString()}</strong></span>
+            <span>🆔 ID: <strong style="font-family:monospace">${d.id}</strong></span>
+            <span>📊 Status: <strong style="color:var(--accent)">${d.status}</strong></span>
+          </div>
+        </div>
+      </div>`;
+
+    // Donut chart
+    const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+    const gridColor = isDark ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.08)';
+    const textColor = isDark ? '#8fa893' : '#3a5c3e';
+
+    const ctx1 = document.getElementById('donut-chart').getContext('2d');
+    new Chart(ctx1, {
+      type:'doughnut',
+      data:{
+        labels:['Sent','Failed','Skipped'],
+        datasets:[{data:[d.sent,d.failed,d.skipped],
+          backgroundColor:['#22c55e','#f87171','#fbbf24'],
+          borderWidth:0, hoverOffset:4}]
+      },
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{position:'bottom',labels:{color:textColor,font:{size:11},padding:8}}}}
+    });
+
+    // Bar chart - opens by method
+    const ctx2 = document.getElementById('bar-chart').getContext('2d');
+    const viaLabels = Object.keys(viaMap).map(k=>k||'unknown');
+    const viaData   = Object.values(viaMap);
+    activeChartInstance = new Chart(ctx2, {
+      type:'bar',
+      data:{
+        labels: viaLabels.length ? viaLabels : ['No opens yet'],
+        datasets:[{label:'Opens',
+          data: viaData.length ? viaData : [0],
+          backgroundColor:'rgba(34,197,94,.7)',
+          borderColor:'#22c55e', borderWidth:1,
+          borderRadius:5}]
+      },
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:false}},
+        scales:{
+          x:{ticks:{color:textColor,font:{size:11}},grid:{color:gridColor}},
+          y:{ticks:{color:textColor,font:{size:11},stepSize:1},grid:{color:gridColor}}
+        }}
+    });
+
+  }catch(e){
+    document.getElementById('analytics-content').innerHTML='<div style="padding:20px;color:var(--error)">Error loading analytics.</div>';
+  }
+}
+
+function closeAnalytics(){
+  document.getElementById('analytics-modal').classList.remove('on');
+  if(activeChartInstance){ activeChartInstance.destroy(); activeChartInstance=null; }
+}
+
+// ══════════════════════════════════════════
+// CAMPAIGN DUPLICATION
+// ══════════════════════════════════════════
+async function duplicateCampaign(campaignId){
+  try{
+    const res = await fetch(`/api/campaigns/${campaignId}/duplicate`,{method:'POST'});
+    const d   = await res.json();
+    if(!d.ok){ toast('Could not duplicate: '+d.error,'bad'); return; }
+
+    // Load the template and subject into the composer
+    if(d.subject) document.getElementById('subject').value = d.subject;
+    if(d.template_html){
+      // Extract just the body content from the full HTML
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(d.template_html,'text/html');
+      const bodyDiv = doc.querySelector('.body');
+      document.getElementById('editor').innerHTML = bodyDiv ? bodyDiv.innerHTML : doc.body.innerHTML;
+    }
+    saveEditorState();
+    toast('✓ Campaign duplicated — edit and resend','ok');
+    goTo(1); // Go to compose step
+  }catch(e){
+    toast('Duplication failed','bad');
+  }
+}
+
 {% endraw %}
 </script>
 </body>
