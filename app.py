@@ -299,24 +299,10 @@ def wrap_links(html_body, campaign_id, encoded_email, base_url):
 
 def inject_tracking(html_body, campaign_id, email, base_url):
     encoded_email = enc(email)
-    unsub_url    = f"{base_url}/track/unsub/{campaign_id}/{encoded_email}"
-    receipt_url  = f"{base_url}/track/receipt/{campaign_id}/{encoded_email}"
+    unsub_url = f"{base_url}/track/unsub/{campaign_id}/{encoded_email}"
 
     html_body = html_body.replace("{{unsubscribe_link}}", unsub_url)
     html_body = html_body.replace("{{ unsubscribe_link }}", unsub_url)
-
-    # ── Confirm Receipt button (visible, reliable open tracking) ──────────────
-    receipt_block = f"""
-<div style="text-align:center;padding:20px 16px 8px;font-family:Arial,sans-serif">
-  <a href="{receipt_url}" style="display:inline-block;background:#22c55e;color:#ffffff;
-     padding:11px 28px;border-radius:7px;text-decoration:none;font-size:13px;
-     font-weight:600;letter-spacing:0.3px;box-shadow:0 2px 8px rgba(34,197,94,.35)">
-    ✅ Confirm Receipt
-  </a>
-  <div style="font-size:11px;color:#999;margin-top:6px">
-    Click to confirm you received this email
-  </div>
-</div>"""
 
     # ── Unsubscribe footer ────────────────────────────────────────────────────
     if "unsubscribe" not in html_body.lower():
@@ -324,15 +310,10 @@ def inject_tracking(html_body, campaign_id, email, base_url):
             f'<div style="text-align:center;padding:8px 12px 16px;font-family:Arial,sans-serif">'
             f'<a href="{unsub_url}" style="color:#aaa;font-size:11px;text-decoration:underline">Unsubscribe</a>'
             f'</div>')
-    else:
-        unsub_footer = ""
-
-    inject = receipt_block + unsub_footer
-
-    if re.search(r"</body>", html_body, re.IGNORECASE):
-        html_body = re.sub(r"</body>", f"{inject}</body>", html_body, flags=re.IGNORECASE)
-    else:
-        html_body += inject
+        if re.search(r"</body>", html_body, re.IGNORECASE):
+            html_body = re.sub(r"</body>", f"{unsub_footer}</body>", html_body, flags=re.IGNORECASE)
+        else:
+            html_body += unsub_footer
 
     # Wrap all links for click tracking
     html_body = wrap_links(html_body, campaign_id, encoded_email, base_url)
@@ -366,10 +347,51 @@ def build_mime(sender_email, sender_name, subject, to_email, html_body, attachme
     return msg
 
 def send_smtp(cfg, mime_msg):
-    with smtplib.SMTP(cfg["smtp_host"], int(cfg["smtp_port"])) as s:
-        s.ehlo(); s.starttls()
+    """Single send — opens/closes connection each time (used for password reset etc.)"""
+    with smtplib.SMTP(cfg["smtp_host"], int(cfg["smtp_port"]), timeout=30) as s:
+        s.ehlo(); s.starttls(); s.ehlo()
         s.login(cfg["smtp_user"], cfg["smtp_password"])
         s.sendmail(cfg["smtp_user"], mime_msg["To"], mime_msg.as_string())
+
+
+def open_smtp_connection(cfg):
+    """Open a persistent SMTP connection. Tries STARTTLS (587) then SSL (465)."""
+    host = cfg["smtp_host"]
+    port = int(cfg["smtp_port"])
+    user = cfg["smtp_user"]
+    pw   = cfg["smtp_password"]
+
+    # Try STARTTLS first (port 587)
+    try:
+        s = smtplib.SMTP(host, port, timeout=30)
+        s.ehlo()
+        s.starttls()
+        s.ehlo()
+        s.login(user, pw)
+        log.info(f"SMTP connected via STARTTLS on port {port}")
+        return s
+    except Exception as e1:
+        log.warning(f"STARTTLS failed on port {port}: {e1}")
+
+    # Fallback: try SSL on port 465
+    try:
+        import ssl
+        ctx = ssl.create_default_context()
+        s = smtplib.SMTP_SSL(host, 465, timeout=30, context=ctx)
+        s.ehlo()
+        s.login(user, pw)
+        log.info(f"SMTP connected via SSL on port 465")
+        return s
+    except Exception as e2:
+        log.warning(f"SSL fallback also failed on port 465: {e2}")
+
+    # Both failed — raise a clear error
+    raise ConnectionError(
+        f"Could not connect to {host}. "
+        f"Tried port {port} (STARTTLS) and port 465 (SSL). "
+        f"Check your SMTP settings and App Password."
+    )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CAMPAIGN RUNNER
@@ -386,55 +408,91 @@ def run_campaign(campaign_id, user_id, cfg, recipients, template_str,
         if use_ai and not api_key:
             state["log"].append({"type":"warn","msg":"⚠️ AI skipped — ANTHROPIC_API_KEY not set."})
 
-        for i, recipient in enumerate(recipients):
-            if state.get("cancelled"):
-                state["status"] = "cancelled"; break
-
-            email = detect_email(recipient)
-            state["current"] = i + 1
-            state["current_email"] = email
-
-            db = get_db()
-            is_unsubbed = db.execute(
-                "SELECT 1 FROM unsub_records WHERE campaign_id=? AND email=?",
-                (campaign_id, email)).fetchone()
-            if is_unsubbed:
-                state["skipped"] += 1
-                state["log"].append({"type":"warn","msg":f"Skipped unsubscribed: {email}"}); continue
-
-            if not email or "@" not in email:
-                state["skipped"] += 1
-                state["log"].append({"type":"warn","msg":f"Row {i+1}: No valid email"}); continue
-
+        # Open one persistent SMTP connection for the whole campaign
+        smtp_conn = None
+        if not dry_run:
             try:
-                if use_ai and ai_client:
-                    recipient["ai_paragraph"] = generate_ai_paragraph(recipient, ai_client)
-                subject   = render_html(cfg.get("subject_template","Hello"), recipient)
-                html_body = render_html(template_str, recipient)
-                if not dry_run:
-                    html_body = inject_tracking(html_body, campaign_id, email, base_url)
-                mime_msg = build_mime(cfg["smtp_user"], cfg.get("from_name",""),
-                                      subject, email, html_body, attachments)
-                if dry_run:
-                    preview_dir = Path(f"previews/{campaign_id}"); preview_dir.mkdir(parents=True, exist_ok=True)
-                    (preview_dir / f"{email.replace('@','_at_').replace('.','_')}.html").write_text(html_body, encoding='utf-8')
-                    state["log"].append({"type":"info","msg":f"✓ Preview saved for {email}"})
-                else:
-                    send_smtp(cfg, mime_msg)
-                    state["log"].append({"type":"success","msg":f"✓ Sent to {email}"})
-                state["sent"] += 1
-            except TemplateError as e:
-                state["failed"] += 1
-                state["log"].append({"type":"error","msg":f"Template error for {email}: {e} — check for variables with spaces e.g. use {{{{first_name}}}} not {{{{First Name}}}}"})
-            except smtplib.SMTPException as e:
-                state["failed"] += 1
-                state["log"].append({"type":"error","msg":f"SMTP error for {email}: {e}"})
+                smtp_conn = open_smtp_connection(cfg)
+                state["log"].append({"type":"info","msg":"✓ SMTP connection established"})
             except Exception as e:
-                state["failed"] += 1
-                state["log"].append({"type":"error","msg":f"Error for {email}: {e}"})
+                state["status"] = "done"
+                state["log"].append({"type":"error","msg":f"❌ Could not connect to SMTP: {e} — Check host, port, email and App Password in Settings."})
+                save_campaign_to_db(campaign_id, user_id, state)
+                return
 
-            if i % 5 == 0: save_campaign_to_db(campaign_id, user_id, state)
-            time.sleep(float(cfg.get("delay_seconds", 1.0)))
+        try:
+            for i, recipient in enumerate(recipients):
+                if state.get("cancelled"):
+                    state["status"] = "cancelled"; break
+
+                email = detect_email(recipient)
+                state["current"] = i + 1
+                state["current_email"] = email
+
+                db = get_db()
+                is_unsubbed = db.execute(
+                    "SELECT 1 FROM unsub_records WHERE campaign_id=? AND email=?",
+                    (campaign_id, email)).fetchone()
+                if is_unsubbed:
+                    state["skipped"] += 1
+                    state["log"].append({"type":"warn","msg":f"Skipped unsubscribed: {email}"}); continue
+
+                if not email or "@" not in email:
+                    state["skipped"] += 1
+                    state["log"].append({"type":"warn","msg":f"Row {i+1}: No valid email"}); continue
+
+                try:
+                    if use_ai and ai_client:
+                        recipient["ai_paragraph"] = generate_ai_paragraph(recipient, ai_client)
+                    subject   = render_html(cfg.get("subject_template","Hello"), recipient)
+                    html_body = render_html(template_str, recipient)
+                    if not dry_run:
+                        html_body = inject_tracking(html_body, campaign_id, email, base_url)
+                    mime_msg = build_mime(cfg["smtp_user"], cfg.get("from_name",""),
+                                          subject, email, html_body, attachments)
+                    if dry_run:
+                        preview_dir = Path(f"previews/{campaign_id}")
+                        preview_dir.mkdir(parents=True, exist_ok=True)
+                        (preview_dir / f"{email.replace('@','_at_').replace('.','_')}.html").write_text(html_body, encoding='utf-8')
+                        state["log"].append({"type":"info","msg":f"✓ Preview saved for {email}"})
+                    else:
+                        # Try sending — reconnect once if connection dropped
+                        try:
+                            smtp_conn.sendmail(cfg["smtp_user"], email, mime_msg.as_string())
+                        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectionError,
+                                ConnectionResetError, OSError):
+                            # Connection dropped — reconnect and retry once
+                            log.info(f"SMTP reconnecting for {email}…")
+                            try:
+                                smtp_conn.quit()
+                            except Exception:
+                                pass
+                            smtp_conn = open_smtp_connection(cfg)
+                            smtp_conn.sendmail(cfg["smtp_user"], email, mime_msg.as_string())
+                        state["log"].append({"type":"success","msg":f"✓ Sent to {email}"})
+                    state["sent"] += 1
+
+                except TemplateError as e:
+                    state["failed"] += 1
+                    state["log"].append({"type":"error","msg":f"Template error for {email}: {e} — use {{{{first_name}}}} not {{{{First Name}}}}"})
+                except smtplib.SMTPException as e:
+                    state["failed"] += 1
+                    state["log"].append({"type":"error","msg":f"SMTP error for {email}: {e}"})
+                except Exception as e:
+                    state["failed"] += 1
+                    state["log"].append({"type":"error","msg":f"Error for {email}: {e}"})
+
+                if i % 5 == 0:
+                    save_campaign_to_db(campaign_id, user_id, state)
+                time.sleep(float(cfg.get("delay_seconds", 1.0)))
+
+        finally:
+            # Always close SMTP connection when done
+            if smtp_conn:
+                try:
+                    smtp_conn.quit()
+                except Exception:
+                    pass
 
         if not state.get("cancelled"): state["status"] = "done"
         state["progress"] = 100
@@ -812,36 +870,6 @@ def delete_campaign(campaign_id):
     db.commit()
     campaigns.pop(campaign_id,None)
     return jsonify({"ok":True})
-
-
-# ── Confirm Receipt (visible button click tracking) ───────────────────────────
-@app.route("/track/receipt/<campaign_id>/<encoded_email>")
-def track_receipt(campaign_id, encoded_email):
-    """Tracks a confirmed open via button click — most reliable method."""
-    try:
-        with app.app_context():
-            email = dec(encoded_email)
-            record_open_db(campaign_id, email, via="receipt")
-            log.info(f"Receipt confirmed: {email} for campaign {campaign_id}")
-    except Exception as e:
-        log.warning(f"track_receipt: {e}")
-    return """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Receipt Confirmed</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',sans-serif;background:#0b0f0c;
-     display:flex;align-items:center;justify-content:center;min-height:100vh}
-.card{background:#121712;border:1px solid #2a3a2c;border-radius:16px;
-      padding:48px 40px;text-align:center;max-width:400px;width:90%;
-      box-shadow:0 8px 40px rgba(0,0,0,.4)}
-.icon{font-size:56px;margin-bottom:16px}
-h2{color:#22c55e;font-size:24px;margin-bottom:8px;font-weight:700}
-p{color:#6b8a6e;font-size:14px;line-height:1.6}</style></head>
-<body><div class="card">
-  <div class="icon">✅</div>
-  <h2>Receipt Confirmed!</h2>
-  <p>Thank you for confirming you received this email.<br/>You may now close this tab.</p>
-</div></body></html>"""
 
 
 # ── Password Reset ────────────────────────────────────────────────────────────
