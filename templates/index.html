@@ -874,7 +874,7 @@ tr:hover td { background:var(--surface2) }
       <div class="fgroup" style="grid-column:span 2"><label class="flabel">SMTP Host</label><input class="finput" id="smtp-host" placeholder="smtp.gmail.com"/></div>
       <div class="fgroup"><label class="flabel">Port</label><input class="finput" id="smtp-port" type="number" value="587"/></div>
     </div>
-    <div class="fgroup"><label class="flabel">Password / App Password</label><input class="finput" id="smtp-pass" type="password" placeholder="••••••••••••••••"/><p style="font-size:11px;color:var(--warn);margin-top:5px">⚠️ Re-enter your App Password each session — it is never stored in the browser for security.</p></div>
+    <div class="fgroup"><label class="flabel">Password / App Password</label><input class="finput" id="smtp-pass" type="password" placeholder="••••••••••••••••"/><p style="font-size:11px;color:var(--warn);margin-top:5px">⚠️ Re-enter your App Password each session — it is never stored in the browser for security.</p><p id="pw-saved-hint" style="font-size:11px;color:var(--success);margin-top:4px;display:none">✓ Password saved to your account — you can leave this blank next session if unchanged.</p></div>
   </div>
 
   <!-- Campaign options -->
@@ -915,7 +915,7 @@ tr:hover td { background:var(--surface2) }
 
   <div class="actions">
     <button class="btn btn-ghost" onclick="goTo(1)">← Back</button>
-    <button class="btn btn-primary" onclick="goTo(3)">
+    <button class="btn btn-primary" onclick="saveSettingsAndContinue()">
       Review & Launch
       <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd"/></svg>
     </button>
@@ -1322,6 +1322,41 @@ function preset(p,btn){
 // ══════════════════════════════════════════
 // SETTINGS PERSISTENCE
 // ══════════════════════════════════════════
+async function saveSettingsAndContinue(){
+  const pw = document.getElementById('smtp-pass').value;
+  const host = document.getElementById('smtp-host').value;
+
+  if(!host){ toast('Please enter your SMTP host','bad'); return; }
+
+  // Save settings to server DB
+  try{
+    const payload = {
+      from_name: document.getElementById('from-name').value,
+      smtp_host: host,
+      smtp_port: document.getElementById('smtp-port').value,
+      delay:     document.getElementById('delay').value,
+    };
+    if(pw) payload.smtp_pass = pw;
+
+    const res = await fetch('/api/smtp-settings', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await res.json();
+    if(d.ok){
+      if(pw){
+        toast('✓ Settings & password saved','ok');
+        document.getElementById('pw-saved-hint').style.display='block';
+      } else {
+        toast('✓ Settings saved','ok');
+      }
+    }
+  }catch(e){ toast('Could not save settings','bad'); }
+
+  saveSettings();
+  goTo(3);
+}
 function saveSettings(){
   SS.save('settings',{
     fromName: document.getElementById('from-name').value,
@@ -1384,17 +1419,6 @@ function renderAttachments(){
 // ══════════════════════════════════════════
 async function launch(){
   const dry=document.getElementById('send-mode').value==='dry';
-
-  // Validate password is entered
-  const pw = document.getElementById('smtp-pass').value;
-  if(!dry && !pw){
-    toast('⚠️ Please enter your App Password in Step 3 Settings before sending','bad');
-    goTo(2);
-    document.getElementById('smtp-pass').focus();
-    document.getElementById('smtp-pass').style.borderColor='var(--error)';
-    setTimeout(()=>document.getElementById('smtp-pass').style.borderColor='',3000);
-    return;
-  }
   let scheduled_at=null;
   if(document.getElementById('use-sched').checked){
     const dt=document.getElementById('sched-date').value;
@@ -1662,6 +1686,12 @@ window.addEventListener('DOMContentLoaded',async ()=>{
       if(s.smtp_host&&!SS.load('settings',{}).smtpHost) document.getElementById('smtp-host').value=s.smtp_host;
       if(s.smtp_port&&!SS.load('settings',{}).smtpPort) document.getElementById('smtp-port').value=s.smtp_port;
       if(s.delay&&!SS.load('settings',{}).delay) document.getElementById('delay').value=s.delay;
+      // Show saved password indicator
+      if(s.has_password){
+        const hint = document.getElementById('pw-saved-hint');
+        if(hint) hint.style.display='block';
+        document.getElementById('smtp-pass').placeholder='Password saved — leave blank to keep current';
+      }
     }
   }catch(e){}
 

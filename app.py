@@ -588,7 +588,7 @@ def get_smtp():
         "smtp_host": row['smtp_host'],
         "smtp_port": row['smtp_port'],
         "delay":     row['delay'],
-        # Never return the password
+        "has_password": bool(row['smtp_pass']),
     }})
 
 @app.route("/api/smtp-settings", methods=["POST"])
@@ -596,26 +596,26 @@ def get_smtp():
 def save_smtp():
     d = request.json or {}
     db = get_db()
-    existing = db.execute("SELECT 1 FROM smtp_settings WHERE user_id=?",
-                           (session['user_id'],)).fetchone()
+    uid = session['user_id']
+    existing = db.execute("SELECT 1 FROM smtp_settings WHERE user_id=?", (uid,)).fetchone()
     if existing:
-        # Only update password if provided
         if d.get("smtp_pass"):
             db.execute("""UPDATE smtp_settings SET
                 from_name=?,smtp_host=?,smtp_port=?,smtp_pass=?,delay=? WHERE user_id=?""",
                 (d.get("from_name"), d.get("smtp_host"), d.get("smtp_port",587),
-                 d.get("smtp_pass"), d.get("delay",1.5), session['user_id']))
+                 d.get("smtp_pass"), d.get("delay",1.5), uid))
         else:
             db.execute("""UPDATE smtp_settings SET
                 from_name=?,smtp_host=?,smtp_port=?,delay=? WHERE user_id=?""",
                 (d.get("from_name"), d.get("smtp_host"), d.get("smtp_port",587),
-                 d.get("delay",1.5), session['user_id']))
+                 d.get("delay",1.5), uid))
     else:
-        db.execute("""INSERT INTO smtp_settings (user_id,from_name,smtp_host,smtp_port,smtp_pass,delay)
-            VALUES (?,?,?,?,?,?)""",
-            (session['user_id'], d.get("from_name"), d.get("smtp_host"),
-             d.get("smtp_port",587), d.get("smtp_pass"), d.get("delay",1.5)))
+        db.execute("""INSERT INTO smtp_settings
+            (user_id,from_name,smtp_host,smtp_port,smtp_pass,delay) VALUES (?,?,?,?,?,?)""",
+            (uid, d.get("from_name"), d.get("smtp_host"), d.get("smtp_port",587),
+             d.get("smtp_pass"), d.get("delay",1.5)))
     db.commit()
+    log.info(f"SMTP settings saved for {session['user_email']}, has_password={bool(d.get('smtp_pass'))}")
     return jsonify({"ok":True})
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -740,11 +740,16 @@ def launch():
     # Use account email as sender
     cfg["smtp_user"] = user_email
 
-    # Load saved SMTP password if not provided
+    # Load saved SMTP password if not provided in payload
     if not cfg.get("smtp_password"):
         db = get_db()
         row = db.execute("SELECT smtp_pass FROM smtp_settings WHERE user_id=?", (user_id,)).fetchone()
-        if row and row['smtp_pass']: cfg["smtp_password"] = row['smtp_pass']
+        if row and row['smtp_pass']:
+            cfg["smtp_password"] = row['smtp_pass']
+            log.info(f"Using saved SMTP password from DB for {user_email}")
+        else:
+            log.warning(f"No SMTP password found in payload or DB for {user_email}")
+            return jsonify({"ok": False, "error": "App Password is missing. Please enter your Gmail App Password in Step 3 Settings."}), 400
 
     # Save SMTP settings for next time
     if cfg.get("smtp_host"):
