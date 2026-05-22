@@ -355,11 +355,14 @@ def send_smtp(cfg, mime_msg):
 
 
 def open_smtp_connection(cfg):
-    """Open a persistent SMTP connection. Tries STARTTLS (587) then SSL (465)."""
+    """Open a persistent SMTP connection. Tries STARTTLS then SSL."""
     host = cfg["smtp_host"]
     port = int(cfg["smtp_port"])
     user = cfg["smtp_user"]
     pw   = cfg["smtp_password"]
+
+    e1_msg = ""
+    e2_msg = ""
 
     # Try STARTTLS first (port 587)
     try:
@@ -371,7 +374,8 @@ def open_smtp_connection(cfg):
         log.info(f"SMTP connected via STARTTLS on port {port}")
         return s
     except Exception as e1:
-        log.warning(f"STARTTLS failed on port {port}: {e1}")
+        e1_msg = str(e1)
+        log.warning(f"STARTTLS failed on port {port}: {e1_msg}")
 
     # Fallback: try SSL on port 465
     try:
@@ -383,14 +387,44 @@ def open_smtp_connection(cfg):
         log.info(f"SMTP connected via SSL on port 465")
         return s
     except Exception as e2:
-        log.warning(f"SSL fallback also failed on port 465: {e2}")
+        e2_msg = str(e2)
+        log.warning(f"SSL fallback also failed on port 465: {e2_msg}")
 
-    # Both failed — raise a clear error
+    # Both failed — raise with real error details
     raise ConnectionError(
-        f"Could not connect to {host}. "
-        f"Tried port {port} (STARTTLS) and port 465 (SSL). "
-        f"Check your SMTP settings and App Password."
+        f"Port {port} error: {e1_msg} | Port 465 error: {e2_msg}"
     )
+
+
+@app.route("/api/test-smtp", methods=["POST"])
+@login_required
+def test_smtp():
+    """Test SMTP connection and return detailed result."""
+    d = request.json or {}
+    uid = session['user_id']
+    user_email = session['user_email']
+
+    # Get password from request or DB
+    pw = d.get("smtp_pass", "")
+    if not pw:
+        db = get_db()
+        row = db.execute("SELECT smtp_pass FROM smtp_settings WHERE user_id=?", (uid,)).fetchone()
+        if row and row['smtp_pass']:
+            pw = row['smtp_pass']
+
+    host = d.get("smtp_host", "smtp.gmail.com")
+    port = int(d.get("smtp_port", 587))
+
+    if not pw:
+        return jsonify({"ok": False, "error": "No password found. Enter your App Password in Settings."})
+
+    cfg = {"smtp_host": host, "smtp_port": port, "smtp_user": user_email, "smtp_password": pw}
+    try:
+        conn = open_smtp_connection(cfg)
+        conn.quit()
+        return jsonify({"ok": True, "message": f"✅ Connected successfully to {host}!"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 # ══════════════════════════════════════════════════════════════════════════════

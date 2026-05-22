@@ -915,6 +915,7 @@ tr:hover td { background:var(--surface2) }
 
   <div class="actions">
     <button class="btn btn-ghost" onclick="goTo(1)">← Back</button>
+    <button class="btn btn-outline" onclick="testSMTP(this)">🔌 Test Connection</button>
     <button class="btn btn-primary" onclick="saveSettingsAndContinue()">
       Review & Launch
       <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd"/></svg>
@@ -1322,6 +1323,41 @@ function preset(p,btn){
 // ══════════════════════════════════════════
 // SETTINGS PERSISTENCE
 // ══════════════════════════════════════════
+async function testSMTP(btn){
+  btn.disabled=true; btn.textContent='Testing…';
+  try{
+    const res=await fetch('/api/test-smtp',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        smtp_host: document.getElementById('smtp-host').value,
+        smtp_port: document.getElementById('smtp-port').value,
+        smtp_pass: document.getElementById('smtp-pass').value,
+      })
+    });
+    const d=await res.json();
+    if(d.ok){
+      toast(d.message,'ok');
+      btn.textContent='✅ Connected!';
+      btn.style.color='var(--success)';
+      btn.style.borderColor='var(--success)';
+    } else {
+      toast('❌ '+d.error,'bad');
+      btn.textContent='❌ Failed';
+      btn.style.color='var(--error)';
+      btn.style.borderColor='var(--error)';
+    }
+  }catch(e){
+    toast('Test failed: '+e,'bad');
+    btn.textContent='🔌 Test Connection';
+  }
+  setTimeout(()=>{
+    btn.disabled=false;
+    btn.textContent='🔌 Test Connection';
+    btn.style.color=''; btn.style.borderColor='';
+  }, 4000);
+}
+
 async function saveSettingsAndContinue(){
   const pw = document.getElementById('smtp-pass').value;
   const host = document.getElementById('smtp-host').value;
