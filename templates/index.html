@@ -874,7 +874,7 @@ tr:hover td { background:var(--surface2) }
       <div class="fgroup" style="grid-column:span 2"><label class="flabel">SMTP Host</label><input class="finput" id="smtp-host" placeholder="smtp.gmail.com"/></div>
       <div class="fgroup"><label class="flabel">Port</label><input class="finput" id="smtp-port" type="number" value="587"/></div>
     </div>
-    <div class="fgroup"><label class="flabel">Password / App Password</label><input class="finput" id="smtp-pass" type="password" placeholder="••••••••••••••••"/></div>
+    <div class="fgroup"><label class="flabel">Password / App Password</label><input class="finput" id="smtp-pass" type="password" placeholder="••••••••••••••••"/><p style="font-size:11px;color:var(--warn);margin-top:5px">⚠️ Re-enter your App Password each session — it is never stored in the browser for security.</p></div>
   </div>
 
   <!-- Campaign options -->
@@ -1384,6 +1384,17 @@ function renderAttachments(){
 // ══════════════════════════════════════════
 async function launch(){
   const dry=document.getElementById('send-mode').value==='dry';
+
+  // Validate password is entered
+  const pw = document.getElementById('smtp-pass').value;
+  if(!dry && !pw){
+    toast('⚠️ Please enter your App Password in Step 3 Settings before sending','bad');
+    goTo(2);
+    document.getElementById('smtp-pass').focus();
+    document.getElementById('smtp-pass').style.borderColor='var(--error)';
+    setTimeout(()=>document.getElementById('smtp-pass').style.borderColor='',3000);
+    return;
+  }
   let scheduled_at=null;
   if(document.getElementById('use-sched').checked){
     const dt=document.getElementById('sched-date').value;
