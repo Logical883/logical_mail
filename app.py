@@ -16,7 +16,7 @@ from flask import (Flask, Response, g, jsonify, redirect,
 from jinja2 import Template, TemplateError
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+app.secret_key = os.environ.get("SECRET_KEY", "logimail-default-secret-change-in-production")
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB limit
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
