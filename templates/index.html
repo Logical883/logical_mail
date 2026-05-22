@@ -1610,6 +1610,13 @@ async function deleteCampaign(id, btn){
 }
 
 // ══════════════════════════════════════════
+// KEEP-ALIVE — ping server every 9 minutes to prevent Render sleeping
+// ══════════════════════════════════════════
+setInterval(async ()=>{
+  try{ await fetch('/ping'); } catch(e){}
+}, 2 * 60 * 1000); // 2 minutes
+
+// ══════════════════════════════════════════
 // LOGOUT
 // ══════════════════════════════════════════
 async function logout(){
@@ -1630,10 +1637,18 @@ window.addEventListener('DOMContentLoaded',async ()=>{
     const d=await res.json();
     if(d.ok){
       document.getElementById('user-display').textContent=d.name+' · '+d.email;
-      document.getElementById('smtp-user').value=d.email;
-      document.getElementById('smtp-user').readOnly=true;
-      document.getElementById('smtp-user').style.opacity='0.7';
-      document.getElementById('smtp-user').title='Your account email is used as the sender';
+      // Always update smtp-user with current account email
+      const smtpUserField = document.getElementById('smtp-user');
+      smtpUserField.value = d.email;
+      smtpUserField.readOnly = true;
+      smtpUserField.style.opacity = '0.7';
+      smtpUserField.title = 'Your account email is used as the sender';
+      // Clear saved settings if email changed
+      const savedSettings = SS.load('settings', {});
+      if(savedSettings.smtpUser && savedSettings.smtpUser !== d.email){
+        SS.clear('settings');
+      }
+      SS.save('currentEmail', d.email);
     } else { window.location.href='/login'; return; }
   }catch(e){ window.location.href='/login'; return; }
 

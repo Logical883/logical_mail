@@ -1039,5 +1039,33 @@ def campaign_analytics(campaign_id):
     })
 
 
+# ── Keep-alive (prevents Render free tier from sleeping) ─────────────────────
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True, "status": "alive", "time": datetime.utcnow().isoformat()})
+
+
+def keep_alive():
+    """Self-ping every 10 minutes to prevent Render free tier sleep."""
+    import urllib.request
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not render_url:
+        log.info("Keep-alive: RENDER_EXTERNAL_URL not set, skipping self-ping")
+        return
+    while True:
+        time.sleep(120)  # 2 minutes
+        try:
+            urllib.request.urlopen(f"{render_url}/ping", timeout=10)
+            log.info("Keep-alive ping sent")
+        except Exception as e:
+            log.warning(f"Keep-alive ping failed: {e}")
+
+# Start keep-alive thread when running on Render
+if os.environ.get("RENDER_EXTERNAL_URL"):
+    t = threading.Thread(target=keep_alive, daemon=True)
+    t.start()
+    log.info("Keep-alive thread started")
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
